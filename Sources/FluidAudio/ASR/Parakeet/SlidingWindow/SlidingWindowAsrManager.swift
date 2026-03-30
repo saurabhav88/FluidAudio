@@ -27,6 +27,7 @@ public actor SlidingWindowAsrManager {
     private var segmentIndex: Int = 0
     private var lastProcessedFrame: Int = 0
     private var accumulatedTokens: [Int] = []
+    private var chunkTexts: [String] = []  // Per-chunk text for boundary-aware dedup
 
     // Raw sample buffer for sliding-window assembly (absolute indexing)
     private var sampleBuffer: [Float] = []
@@ -144,6 +145,7 @@ public actor SlidingWindowAsrManager {
         segmentIndex = 0
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
+        chunkTexts.removeAll()
 
         startTime = Date()
 
@@ -214,19 +216,21 @@ public actor SlidingWindowAsrManager {
 
         let finalText: String
         if vocabBoostingEnabled {
-            // Text-based reconstruction preserves rescored corrections from processWindow().
-            // Token-based reconstruction would undo rescoring since it decodes raw tokens.
             var parts: [String] = []
             if !confirmedTranscript.isEmpty { parts.append(confirmedTranscript) }
             if !volatileTranscript.isEmpty { parts.append(volatileTranscript) }
             finalText = parts.joined(separator: " ")
+        } else if !chunkTexts.isEmpty {
+            // Assemble from per-chunk texts with boundary-aware overlap removal.
+            // Only dedup at known chunk boundaries, preserving intentional repetitions within chunks.
+            finalText = Self.assembleChunkTexts(chunkTexts)
         } else if let asrManager = asrManager, !accumulatedTokens.isEmpty {
             let finalResult = await asrManager.processTranscriptionResult(
                 tokenIds: accumulatedTokens,
                 timestamps: [],
-                confidences: [],  // No per-token confidences needed for final text
+                confidences: [],
                 encoderSequenceLength: 0,
-                audioSamples: [],  // Not needed for final text conversion
+                audioSamples: [],
                 processingTime: 0
             )
             finalText = finalResult.text
@@ -237,8 +241,92 @@ public actor SlidingWindowAsrManager {
             finalText = parts.joined(separator: " ")
         }
 
-        logger.info("Final transcription: \(finalText.count) characters")
+        logger.info("Final transcription: \(finalText.count) characters from \(chunkTexts.count) chunks")
         return finalText
+    }
+
+    /// Assemble per-chunk text outputs with overlap removal at chunk boundaries.
+    /// Each chunk may re-decode some of the previous chunk's tail content due to fresh decoder state.
+    /// This method finds and removes the overlapping prefix of each subsequent chunk.
+    internal static func assembleChunkTexts(_ chunks: [String]) -> String {
+        guard !chunks.isEmpty else { return "" }
+        guard chunks.count > 1 else { return chunks[0] }
+
+        var assembled = chunks[0]
+
+        for i in 1..<chunks.count {
+            let current = chunks[i]
+            guard !current.isEmpty else { continue }
+
+            // Find the longest suffix of `assembled` that matches a prefix of `current`
+            // Compare at word level for robustness
+            let prevWords = assembled.components(separatedBy: " ").filter { !$0.isEmpty }
+            let currWords = current.components(separatedBy: " ").filter { !$0.isEmpty }
+
+            // Search for overlap: last N words of prev == first N words of curr
+            // Check up to 15 words of overlap (covers ~2s of context at 150 wpm)
+            let maxOverlap = min(15, min(prevWords.count, currWords.count))
+            var bestOverlap = 0
+
+            for overlapLen in (1...max(1, maxOverlap)).reversed() {
+                let prevTail = prevWords.suffix(overlapLen).map {
+                    $0.trimmingCharacters(in: .punctuationCharacters).lowercased()
+                }
+                let currHead = currWords.prefix(overlapLen).map {
+                    $0.trimmingCharacters(in: .punctuationCharacters).lowercased()
+                }
+
+                if prevTail == Array(currHead) {
+                    bestOverlap = overlapLen
+                    break
+                }
+            }
+
+            if bestOverlap > 0 {
+                // When the overlap boundary word in assembled ends with punctuation that
+                // shouldn't be there (because the next chunk continues the sentence),
+                // strip the trailing punctuation from the overlap point.
+                let overlapEndWord = prevWords[prevWords.count - bestOverlap]
+                let overlapEndBase = overlapEndWord.trimmingCharacters(in: .punctuationCharacters)
+                if overlapEndWord != overlapEndBase && !overlapEndBase.isEmpty {
+                    // Replace the last occurrence of the punctuated word with the base form
+                    if let range = assembled.range(
+                        of: overlapEndWord, options: .backwards
+                    ) {
+                        assembled.replaceSubrange(range, with: overlapEndBase)
+                    }
+                }
+
+                // Skip the overlapping prefix of current chunk
+                let remainder = currWords.dropFirst(bestOverlap).joined(separator: " ")
+                if !remainder.isEmpty {
+                    assembled += " " + remainder
+                }
+            } else {
+                // Check for partial-word overlap at the boundary.
+                // Pattern: prev ends with "corrections." and curr starts with "ctions." --
+                // the first word of curr is a suffix of the last word of prev.
+                let lastPrevWord = prevWords.last ?? ""
+                let firstCurrWord = currWords.first ?? ""
+                let lastPrevBase = lastPrevWord.trimmingCharacters(in: .punctuationCharacters).lowercased()
+                let firstCurrBase = firstCurrWord.trimmingCharacters(in: .punctuationCharacters).lowercased()
+
+                if firstCurrBase.count >= 3 && lastPrevBase.count > firstCurrBase.count
+                    && lastPrevBase.hasSuffix(firstCurrBase)
+                {
+                    // Skip the partial-word fragment and append the rest
+                    let remainder = currWords.dropFirst(1).joined(separator: " ")
+                    if !remainder.isEmpty {
+                        assembled += " " + remainder
+                    }
+                } else {
+                    // No overlap found, just append
+                    assembled += " " + current
+                }
+            }
+        }
+
+        return assembled
     }
 
     /// Reset the transcriber for a new session
@@ -260,6 +348,7 @@ public actor SlidingWindowAsrManager {
         segmentIndex = 0
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
+        chunkTexts.removeAll()
 
         logger.info("SlidingWindowAsrManager reset for source: \(String(describing: self.audioSource))")
     }
@@ -404,6 +493,9 @@ public actor SlidingWindowAsrManager {
                 audioSamples: windowSamples,
                 processingTime: processingTime
             )
+
+            // Store per-chunk text for boundary-aware dedup in finish()
+            chunkTexts.append(interim.text)
 
             logger.debug(
                 "Chunk \(self.processedChunks): '\(interim.text)', time: \(String(format: "%.3f", processingTime))s)"

@@ -202,15 +202,20 @@ extension AsrManager {
         return try MLDictionaryFeatureProvider(dictionary: features)
     }
 
-    /// Chunk transcription that preserves decoder state between calls.
+    /// Chunk transcription with fresh decoder state per chunk.
     /// Used by SlidingWindowAsrManager for overlapping-window processing with token deduplication.
+    /// Each chunk decodes independently to prevent LSTM state contamination that causes
+    /// progressive text loss at chunk tails (observed as ~12% word loss at 60s+ durations).
     public func transcribeChunk(
         _ chunkSamples: [Float],
         source: AudioSource,
         previousTokens: [Int] = [],
         isLastChunk: Bool = false
     ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], encoderSequenceLength: Int) {
-        var state = decoderState(for: source)
+        // Use fresh decoder state each chunk. Carrying LSTM state across chunks causes the
+        // decoder to predict blanks too aggressively at chunk tails, silently dropping content.
+        // The token-level dedup handles boundary overlap instead of relying on state continuity.
+        var state = try TdtDecoderState()
 
         let (alignedSamples, frameAlignedLength) = frameAlignedAudio(
             chunkSamples, allowAlignment: previousTokens.isEmpty)
@@ -220,11 +225,11 @@ extension AsrManager {
             originalLength: frameAlignedLength,
             actualAudioFrames: nil,  // Will be calculated from originalLength
             decoderState: &state,
-            contextFrameAdjustment: 0,  // Non-streaming chunks don't use adaptive context
+            contextFrameAdjustment: 0,  // Intentional: decoder has hardcoded 25-frame context skip
             isLastChunk: isLastChunk
         )
 
-        setDecoderState(state, for: source)
+        // Don't persist state: fresh state per chunk is intentional
 
         // Apply token deduplication if previous tokens are provided
         if !previousTokens.isEmpty && hypothesis.hasTokens {
