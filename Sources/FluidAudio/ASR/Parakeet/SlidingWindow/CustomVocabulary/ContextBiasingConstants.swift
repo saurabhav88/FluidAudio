@@ -93,9 +93,9 @@ public enum ContextBiasingConstants {
     /// Slightly above floor to reduce false positives while remaining permissive.
     /// Can be overridden per-vocabulary via `CustomVocabularyContext.minSimilarity`.
     ///
-    /// - Value: `0.52` (52% similarity required)
+    /// - Value: `0.60` (60% similarity required, raised from 0.52 to reduce phantom insertions)
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
-    public static let defaultMinSimilarity: Float = 0.52
+    public static let defaultMinSimilarity: Float = 0.65
 
     /// Default minimum combined confidence threshold.
     ///
@@ -150,7 +150,7 @@ public enum ContextBiasingConstants {
     /// - Value: `3.0` (log-probability boost)
     /// - Effect: Multiplies vocabulary term probability by ~20x (e^3.0)
     /// - Used in: `VocabularyRescorer.ctcTokenRescore()` and constrained CTC methods
-    public static let defaultCbw: Float = 3.0
+    public static let defaultCbw: Float = 1.5
 
     /// Default alpha value for weighted score combination.
     ///
@@ -199,8 +199,8 @@ public enum ContextBiasingConstants {
     public static func rescorerConfig(forVocabSize size: Int) -> VocabSizeConfig {
         let isLarge = size > largeVocabThreshold
         return VocabSizeConfig(
-            minSimilarity: isLarge ? 0.60 : 0.50,
-            cbw: isLarge ? 2.5 : 3.0
+            minSimilarity: isLarge ? 0.65 : 0.65,
+            cbw: isLarge ? 2.0 : 2.5
         )
     }
 
