@@ -85,6 +85,8 @@ struct ChunkProcessor {
             let chunkLengthWithContext = chunkEnd - contextStart
             let chunkSamplesArray = try readSamples(offset: contextStart, count: chunkLengthWithContext)
 
+            logger.info("[ChunkDiag] Chunk \(chunkIndex): start=\(chunkStart), end=\(chunkEnd), isLast=\(isLastChunk), samples=\(chunkLengthWithContext), context=\(contextSamples), timeJump=\(String(describing: chunkDecoderState.timeJump))")
+
             let (windowTokens, windowTimestamps, windowConfidences, windowDurations) = try await transcribeChunk(
                 samples: chunkSamplesArray,
                 contextSamples: contextSamples,
@@ -93,6 +95,8 @@ struct ChunkProcessor {
                 using: manager,
                 decoderState: &chunkDecoderState
             )
+
+            logger.info("[ChunkDiag] Chunk \(chunkIndex) result: tokens=\(windowTokens.count), firstTs=\(windowTimestamps.first.map(String.init) ?? "nil"), lastTs=\(windowTimestamps.last.map(String.init) ?? "nil"), timeJumpAfter=\(String(describing: chunkDecoderState.timeJump))")
 
             // Combine tokens, timestamps, and confidences into aligned tuples
             guard windowTokens.count == windowTimestamps.count && windowTokens.count == windowConfidences.count else {
@@ -182,31 +186,36 @@ struct ChunkProcessor {
 
         let paddedChunk = manager.padAudioIfNeeded(samples, targetLength: maxModelSamples)
 
-        // Calculate frame count for the ACTUAL audio (excluding prepended context)
-        let actualAudioSamples = samples.count - contextSamples
-        let actualFrameCount = ASRConstants.calculateEncoderFrames(from: actualAudioSamples)
-
-        // Global frame offset is based on original chunkStart (not context-adjusted start)
+        // Decode the full local window with zero adjustments, matching the streaming contract.
+        // The decoder's hardcoded 25-frame context skip handles overlap internally when
+        // state is fresh. Passing non-zero contextFrameAdjustment causes double-skipping
+        // (proven in streaming fix ablation: -13.7% text loss vs -11.8% baseline).
+        // Global frame offsets are applied to timestamps AFTER decode, not during.
         let globalFrameOffset = chunkStart / ASRConstants.samplesPerEncoderFrame
 
-        // Context frame adjustment tells decoder to skip the prepended context frames
-        let contextFrames = contextSamples / ASRConstants.samplesPerEncoderFrame
+        logger.info("[ChunkDiag] transcribeChunk: samples=\(samples.count), contextSamples=\(contextSamples), globalOffset=\(globalFrameOffset), isLast=\(isLastChunk)")
 
         let (hypothesis, encoderSequenceLength) = try await manager.executeMLInferenceWithTimings(
             paddedChunk,
-            originalLength: samples.count,  // Full length including context
-            actualAudioFrames: actualFrameCount,  // Only actual audio frames (excluding context)
+            originalLength: samples.count,
+            actualAudioFrames: nil,
             decoderState: &decoderState,
-            contextFrameAdjustment: contextFrames,  // Skip context frames in decoder
+            contextFrameAdjustment: 0,
             isLastChunk: isLastChunk,
-            globalFrameOffset: globalFrameOffset
+            globalFrameOffset: 0
         )
 
+        logger.info("[ChunkDiag] inference result: encLen=\(encoderSequenceLength), tokens=\(hypothesis.ySequence.count), isEmpty=\(hypothesis.isEmpty)")
+
         if hypothesis.isEmpty || encoderSequenceLength == 0 {
+            logger.warning("[ChunkDiag] EMPTY CHUNK: hypothesis.isEmpty=\(hypothesis.isEmpty), encLen=\(encoderSequenceLength)")
             return ([], [], [], [])
         }
 
-        return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations)
+        // Apply global frame offset to timestamps externally (decoder returned chunk-local timestamps)
+        let globalTimestamps = hypothesis.timestamps.map { $0 + globalFrameOffset }
+
+        return (hypothesis.ySequence, globalTimestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations)
     }
 
     private func mergeChunks(
