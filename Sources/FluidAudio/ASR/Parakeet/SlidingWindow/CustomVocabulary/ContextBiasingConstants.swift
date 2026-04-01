@@ -54,7 +54,7 @@ public enum ContextBiasingConstants {
     ///
     /// - Value: `-12.0` (log-probability, ~6e-6 probability)
     /// - Used in: `CustomVocabularyContext.init()` as default
-    public static let defaultMinVocabCtcScore: Float = -12.0
+    public static let defaultMinVocabCtcScore: Float = -2.2
 
     /// CTC temperature for softmax probability distribution.
     ///
@@ -95,7 +95,7 @@ public enum ContextBiasingConstants {
     ///
     /// - Value: `0.60` (60% similarity required, raised from 0.52 to reduce phantom insertions)
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
-    public static let defaultMinSimilarity: Float = 0.65
+    public static let defaultMinSimilarity: Float = 0.72
 
     /// Default minimum combined confidence threshold.
     ///
@@ -104,7 +104,7 @@ public enum ContextBiasingConstants {
     ///
     /// - Value: `0.54` (slightly above default similarity)
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
-    public static let defaultMinCombinedConfidence: Float = 0.54
+    public static let defaultMinCombinedConfidence: Float = 0.64
 
     /// Length ratio threshold below which stricter similarity is required.
     ///
@@ -160,7 +160,7 @@ public enum ContextBiasingConstants {
     /// - Value: `0.5` (equal weighting)
     /// - Range: 0.0 (LM only) to 1.0 (acoustic only)
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
-    public static let defaultAlpha: Float = 0.5
+    public static let defaultAlpha: Float = 2.8
 
     /// Default margin in seconds for CTC frame alignment.
     ///
@@ -197,10 +197,10 @@ public enum ContextBiasingConstants {
     /// - Parameter size: Number of vocabulary terms.
     /// - Returns: `VocabSizeConfig` with appropriate thresholds.
     public static func rescorerConfig(forVocabSize size: Int) -> VocabSizeConfig {
-        let isLarge = size > largeVocabThreshold
+        // FluidVoice-derived thresholds: uniform 0.72 regardless of vocab size
         return VocabSizeConfig(
-            minSimilarity: isLarge ? 0.65 : 0.65,
-            cbw: isLarge ? 2.0 : 2.5
+            minSimilarity: 0.72,
+            cbw: 2.5
         )
     }
 
