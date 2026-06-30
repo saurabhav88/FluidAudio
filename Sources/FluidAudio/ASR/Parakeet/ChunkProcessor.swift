@@ -42,6 +42,11 @@ struct ChunkProcessor {
         return raw / ASRConstants.samplesPerEncoderFrame * ASRConstants.samplesPerEncoderFrame
     }
 
+    /// #1237 empty-chunk recovery: minimum encoder frames a window must have produced
+    /// before an all-blank decode is treated as recoverable speech (rather than genuine
+    /// trailing silence / no speech). 25 frames = 2.0s at `secondsPerEncoderFrame` (0.08s).
+    private static let recoverableEmptyMinFrames: Int = 25
+
     /// Initialize with a streaming audio sample source for memory-efficient processing.
     init(sampleSource: AudioSampleSource) {
         self.sampleSource = sampleSource
@@ -85,7 +90,9 @@ struct ChunkProcessor {
             let chunkLengthWithContext = chunkEnd - contextStart
             let chunkSamplesArray = try readSamples(offset: contextStart, count: chunkLengthWithContext)
 
-            logger.info("[ChunkDiag] Chunk \(chunkIndex): start=\(chunkStart), end=\(chunkEnd), isLast=\(isLastChunk), samples=\(chunkLengthWithContext), context=\(contextSamples), timeJump=\(String(describing: chunkDecoderState.timeJump))")
+            logger.info(
+                "[ChunkDiag] Chunk \(chunkIndex): start=\(chunkStart), end=\(chunkEnd), isLast=\(isLastChunk), samples=\(chunkLengthWithContext), context=\(contextSamples), timeJump=\(String(describing: chunkDecoderState.timeJump))"
+            )
 
             let (windowTokens, windowTimestamps, windowConfidences, windowDurations) = try await transcribeChunk(
                 samples: chunkSamplesArray,
@@ -96,7 +103,9 @@ struct ChunkProcessor {
                 decoderState: &chunkDecoderState
             )
 
-            logger.info("[ChunkDiag] Chunk \(chunkIndex) result: tokens=\(windowTokens.count), firstTs=\(windowTimestamps.first.map(String.init) ?? "nil"), lastTs=\(windowTimestamps.last.map(String.init) ?? "nil"), timeJumpAfter=\(String(describing: chunkDecoderState.timeJump))")
+            logger.info(
+                "[ChunkDiag] Chunk \(chunkIndex) result: tokens=\(windowTokens.count), firstTs=\(windowTimestamps.first.map(String.init) ?? "nil"), lastTs=\(windowTimestamps.last.map(String.init) ?? "nil"), timeJumpAfter=\(String(describing: chunkDecoderState.timeJump))"
+            )
 
             // Combine tokens, timestamps, and confidences into aligned tuples
             guard windowTokens.count == windowTimestamps.count && windowTokens.count == windowConfidences.count else {
@@ -193,7 +202,9 @@ struct ChunkProcessor {
         // Global frame offsets are applied to timestamps AFTER decode, not during.
         let globalFrameOffset = chunkStart / ASRConstants.samplesPerEncoderFrame
 
-        logger.info("[ChunkDiag] transcribeChunk: samples=\(samples.count), contextSamples=\(contextSamples), globalOffset=\(globalFrameOffset), isLast=\(isLastChunk)")
+        logger.info(
+            "[ChunkDiag] transcribeChunk: samples=\(samples.count), contextSamples=\(contextSamples), globalOffset=\(globalFrameOffset), isLast=\(isLastChunk)"
+        )
 
         let (hypothesis, encoderSequenceLength) = try await manager.executeMLInferenceWithTimings(
             paddedChunk,
@@ -205,10 +216,28 @@ struct ChunkProcessor {
             globalFrameOffset: 0
         )
 
-        logger.info("[ChunkDiag] inference result: encLen=\(encoderSequenceLength), tokens=\(hypothesis.ySequence.count), isEmpty=\(hypothesis.isEmpty)")
+        logger.info(
+            "[ChunkDiag] inference result: encLen=\(encoderSequenceLength), tokens=\(hypothesis.ySequence.count), isEmpty=\(hypothesis.isEmpty)"
+        )
 
         if hypothesis.isEmpty || encoderSequenceLength == 0 {
-            logger.warning("[ChunkDiag] EMPTY CHUNK: hypothesis.isEmpty=\(hypothesis.isEmpty), encLen=\(encoderSequenceLength)")
+            logger.warning(
+                "[ChunkDiag] EMPTY CHUNK: hypothesis.isEmpty=\(hypothesis.isEmpty), encLen=\(encoderSequenceLength)")
+            // #1237 tail-clip recovery: a window with substantial encoder frames that decoded
+            // to ZERO tokens still carries real speech the TDT decoder blanked (typically the
+            // end of a dictation after a mid-sentence pause). Recover it by re-decoding the
+            // window's internal speech islands. Genuine trailing-silence / no-speech windows
+            // (few real frames) fall below the threshold and keep returning empty as today.
+            if encoderSequenceLength >= Self.recoverableEmptyMinFrames {
+                if let recovered = try await recoverEmptyChunk(
+                    samples: samples,
+                    chunkStart: chunkStart,
+                    isLastChunk: isLastChunk,
+                    using: manager
+                ) {
+                    return recovered
+                }
+            }
             return ([], [], [], [])
         }
 
@@ -216,6 +245,118 @@ struct ChunkProcessor {
         let globalTimestamps = hypothesis.timestamps.map { $0 + globalFrameOffset }
 
         return (hypothesis.ySequence, globalTimestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations)
+    }
+
+    /// Recover a window that decoded to ZERO tokens despite carrying substantial speech
+    /// (#1237 end-of-dictation tail clip). Splits the window's `samples` at internal silence
+    /// into speech islands, decodes each ONCE with a fresh decoder state, offsets the
+    /// island-local timestamps onto the window's timestamp basis, and returns the assembled
+    /// token tuple for `process()` to merge exactly as a normal window.
+    ///
+    /// Heart-path safe and fail-open: returns `nil` (the caller falls back to today's exact empty
+    /// result) when there are no usable islands, the island count exceeds the cap, or every island
+    /// re-blanks. A single island that re-blanks is DROPPED while the others are kept (partial
+    /// recovery recovers strictly more real speech than abandoning the window — never worse than
+    /// today). A genuine decode error returns `nil`; cancellation is rethrown so it aborts the whole
+    /// transcription. Each island decodes once — no recursion, no retry — so a blank can never loop.
+    private func recoverEmptyChunk(
+        samples: [Float],
+        chunkStart: Int,
+        isLastChunk: Bool,
+        using manager: AsrManager
+    ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int])? {
+        let detector = SilenceIslandDetector()
+        let islands = detector.islands(in: samples)
+        guard !islands.isEmpty, islands.count <= detector.maxIslands else {
+            logger.warning(
+                "[ChunkDiag] recovery: \(islands.isEmpty ? "no speech islands" : "island count \(islands.count) > cap \(detector.maxIslands)") — fail-open"
+            )
+            return nil
+        }
+
+        let decoderLayers = await manager.decoderLayerCount
+        var tokens: [Int] = []
+        var timestamps: [Int] = []
+        var confidences: [Float] = []
+        var durations: [Int] = []
+
+        for island in islands {
+            let islandSamples = Array(samples[island.start..<island.end])
+            let padded = manager.padAudioIfNeeded(islandSamples, targetLength: maxModelSamples)
+            var state = TdtDecoderState.make(decoderLayers: decoderLayers)
+            do {
+                // Decode the island with a fresh decoder state. Pass through the OUTER window's
+                // isLastChunk: only the final window may fire the decoder's last-chunk
+                // finalization (flush the true tail); an interior empty window must NOT finalize,
+                // or it injects EOF boundary tokens/punctuation before the next chunk merges
+                // (Codex code-diff review, #1237). globalFrameOffset 0: timestamps are offset
+                // externally below so the basis matches the normal window convention.
+                let (hypothesis, islandEncoderLength) = try await manager.executeMLInferenceWithTimings(
+                    padded,
+                    originalLength: islandSamples.count,
+                    actualAudioFrames: nil,
+                    decoderState: &state,
+                    contextFrameAdjustment: 0,
+                    isLastChunk: isLastChunk,
+                    globalFrameOffset: 0
+                )
+                guard !hypothesis.isEmpty, islandEncoderLength > 0 else {
+                    // Drop this one island and KEEP the others (partial recovery). Empirically this
+                    // recovers strictly more real speech than abandoning the whole window: on the real
+                    // clip A8171A1F one island re-blanks while the rest yield "...that you should be
+                    // using today" — partial keeps that tail; all-or-nothing would discard it and
+                    // regress to today's full-window drop. A dropped island is never worse than today
+                    // (which loses the entire window). Each island decodes once, so a deterministic
+                    // blank can never loop. (Codex flagged a doc/code mismatch here; resolved toward
+                    // partial — the plan's design — backed by the A8171A1F regression, not toward
+                    // all-or-nothing which the data shows loses a real recovery.)
+                    logger.info(
+                        "[ChunkDiag] recovery: island [\(island.start),\(island.end)) re-blanked — dropped, keeping other islands"
+                    )
+                    continue
+                }
+                let offsetTimestamps = Self.offsetIslandTimestamps(
+                    hypothesis.timestamps,
+                    chunkStart: chunkStart,
+                    islandStartSampleWithinWindow: island.start)
+                tokens.append(contentsOf: hypothesis.ySequence)
+                timestamps.append(contentsOf: offsetTimestamps)
+                confidences.append(contentsOf: hypothesis.tokenConfidences)
+                durations.append(contentsOf: hypothesis.tokenDurations)
+            } catch is CancellationError {
+                // Cancellation must abort the whole transcription, NOT degrade to a partial/empty
+                // result — rethrow so process()'s caller sees it (Codex code-diff review, #1237).
+                throw CancellationError()
+            } catch {
+                logger.warning(
+                    "[ChunkDiag] recovery: island decode failed (\(error.localizedDescription)) — fail-open")
+                return nil
+            }
+        }
+
+        guard !tokens.isEmpty else { return nil }
+        // Islands are processed left-to-right and each island's tokens are already time-ordered,
+        // so the concatenation is in ascending timestamp order; process() merges it normally.
+        logger.info(
+            "[ChunkDiag] recovery: recovered \(tokens.count) token(s) across \(islands.count) island(s)")
+        return (tokens, timestamps, confidences, durations)
+    }
+
+    /// Offset a recovered island's decoder-local frame timestamps onto the window's timestamp
+    /// basis so `mergeChunks` dedups them against prior windows. Matches the EXISTING
+    /// ChunkProcessor convention (chunkStart-based, deliberately NOT true sample-global —
+    /// `transcribeChunk` applies `chunkStart / samplesPerEncoderFrame` at decode return).
+    /// `islandStartSampleWithinWindow` is measured within the context-prefixed window `samples`
+    /// array and MUST be encoder-frame-aligned (the detector snaps island starts down to a
+    /// frame multiple) so the division is exact.
+    static func offsetIslandTimestamps(
+        _ localTimestamps: [Int],
+        chunkStart: Int,
+        islandStartSampleWithinWindow: Int
+    ) -> [Int] {
+        let frame = ASRConstants.samplesPerEncoderFrame
+        let offset = (chunkStart / frame) + (islandStartSampleWithinWindow / frame)
+        return localTimestamps.map { $0 + offset }
     }
 
     private func mergeChunks(
@@ -444,3 +585,130 @@ struct ChunkProcessor {
         return trimmedLeft + trimmedRight
     }
 }
+
+/// Energy-based speech-island detector used ONLY by `ChunkProcessor.recoverEmptyChunk`
+/// to split an already-failed (empty) ASR window at internal silence into 1..N speech
+/// islands. Energy-only (no VAD-model dependency) is acceptable because this runs solely
+/// on a window that ALREADY decoded empty: a wrong split costs at worst a slightly-worse
+/// re-decode, never dropped audio. The threshold is scale-invariant (works on normalized
+/// float or raw audio) so it needs no per-scale tuning.
+struct SilenceIslandDetector {
+    /// RMS analysis frame length in samples (100ms at 16kHz).
+    let analysisFrameSamples: Int
+    /// Minimum run of silent analysis frames that separates two islands.
+    let minSilenceFrames: Int
+    /// Minimum island length (samples) kept after padding.
+    let minIslandSamples: Int
+    /// Padding (samples) added on each side of a detected island.
+    let paddingSamples: Int
+    /// Hard cap on island count; above this the caller fails open.
+    let maxIslands: Int
+
+    init(minSilenceMs: Int = 300, minIslandMs: Int = 320, paddingMs: Int = 100, maxIslands: Int = 8) {
+        let sr = ASRConstants.sampleRate
+        self.analysisFrameSamples = max(1, sr / 10)  // 1600 = 100ms
+        self.minSilenceFrames = max(1, minSilenceMs / 100)
+        self.minIslandSamples = max(1, minIslandMs * sr / 1000)
+        self.paddingSamples = max(0, paddingMs * sr / 1000)
+        self.maxIslands = max(1, maxIslands)
+    }
+
+    /// Returns frame-aligned `[start, end)` sample ranges of speech islands within `samples`.
+    /// Island STARTS are snapped down to encoder-frame multiples so the caller's timestamp
+    /// offset (`islandStart / samplesPerEncoderFrame`) is exact; ends are clamped to the
+    /// window length (`padAudioIfNeeded` + `originalLength` handle a non-aligned tail).
+    func islands(in samples: [Float]) -> [(start: Int, end: Int)] {
+        let n = samples.count
+        guard n >= analysisFrameSamples else { return [] }
+        let frame = ASRConstants.samplesPerEncoderFrame
+
+        // 1. RMS per analysis frame.
+        var frameRMS: [Float] = []
+        frameRMS.reserveCapacity(n / analysisFrameSamples + 1)
+        var i = 0
+        while i < n {
+            let end = min(i + analysisFrameSamples, n)
+            var sumSquares: Float = 0
+            for s in i..<end { sumSquares += samples[s] * samples[s] }
+            frameRMS.append((sumSquares / Float(end - i)).squareRoot())
+            i += analysisFrameSamples
+        }
+        guard !frameRMS.isEmpty else { return [] }
+
+        // 2. Voiced threshold.
+        //    - Absolute silence floor: a window whose loudest frame is near-silent has no real
+        //      speech to recover → no islands (recovery fails open). This rejects all-silence.
+        //    - Otherwise threshold above the noise floor (20th-pct RMS), but CAPPED at half the
+        //      peak so a uniform all-speech window (noise floor ≈ peak) can't exclude its own
+        //      speech; floored at a small fraction of the peak so a low-noise-floor bimodal
+        //      window (the #1237 silence-then-speech shape) still splits at the speech edge.
+        let sortedRMS = frameRMS.sorted()
+        let noiseFloor = sortedRMS[min(sortedRMS.count - 1, (sortedRMS.count * 20) / 100)]
+        let peak = sortedRMS.last ?? 0
+        let speechFloor: Float = 0.005  // normalized-audio RMS below this peak = no speech
+        guard peak >= speechFloor else { return [] }
+        let threshold = max(peak * 0.05, min(noiseFloor * 2.5, peak * 0.5))
+        var voiced = frameRMS.map { $0 >= threshold }
+
+        // 3. Bridge silence gaps shorter than minSilenceFrames so micro-pauses don't split.
+        var g = 0
+        while g < voiced.count {
+            if !voiced[g] {
+                var j = g
+                while j < voiced.count && !voiced[j] { j += 1 }
+                if (j - g) < minSilenceFrames {
+                    for k in g..<j { voiced[k] = true }
+                }
+                g = j
+            } else {
+                g += 1
+            }
+        }
+
+        // 4. Extract voiced runs → padded, frame-aligned, non-overlapping islands.
+        var result: [(start: Int, end: Int)] = []
+        var lastEnd = 0
+        var f = 0
+        while f < voiced.count {
+            if voiced[f] {
+                var j = f
+                while j < voiced.count && voiced[j] { j += 1 }
+                var start = max(0, f * analysisFrameSamples - paddingSamples)
+                let end = min(n, j * analysisFrameSamples + paddingSamples)
+                // Frame-align the START down so islandStart / frame is exact, and keep islands
+                // disjoint (padding can never bridge a >=minSilence gap, but guard anyway).
+                start = (start / frame) * frame
+                start = max(start, lastEnd)
+                if end - start >= minIslandSamples {
+                    result.append((start: start, end: end))
+                    lastEnd = end
+                }
+                f = j
+            } else {
+                f += 1
+            }
+        }
+        return result
+    }
+}
+
+#if DEBUG
+extension ChunkProcessor {
+    /// Test-only seam exposing the private overlap merge with a plain tuple type so seam
+    /// tests (e.g. the #1237 divergent-overlap test) can exercise the REAL dedup logic.
+    func mergeChunksForTesting(
+        _ left: [(token: Int, timestamp: Int, confidence: Float, duration: Int)],
+        _ right: [(token: Int, timestamp: Int, confidence: Float, duration: Int)]
+    ) -> [(token: Int, timestamp: Int, confidence: Float, duration: Int)] {
+        let l = left.map {
+            TokenWindow(token: $0.token, timestamp: $0.timestamp, confidence: $0.confidence, duration: $0.duration)
+        }
+        let r = right.map {
+            TokenWindow(token: $0.token, timestamp: $0.timestamp, confidence: $0.confidence, duration: $0.duration)
+        }
+        return mergeChunks(l, r).map {
+            (token: $0.token, timestamp: $0.timestamp, confidence: $0.confidence, duration: $0.duration)
+        }
+    }
+}
+#endif
