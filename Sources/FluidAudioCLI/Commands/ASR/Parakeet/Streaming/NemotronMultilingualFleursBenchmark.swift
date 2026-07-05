@@ -787,16 +787,17 @@ extension NemotronMultilingualFleursBenchmark {
 
             // Print summary table
             print("")
-            print(
-                "Language".padding(toLength: 12, withPad: " ", startingAt: 0) + " | "
-                    + "Prompt".padding(toLength: 8, withPad: " ", startingAt: 0) + " | "
-                    + "WER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "CER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "RTFx".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "Duration".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                    + "Processed".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                    + "Skipped"
-            )
+            // Built row-wise: the single chained + expression exceeds the Swift 6.x
+            // type-checker budget on some toolchains (build fix, EnviousWispr fork).
+            let headerColumns: [(String, Int)] = [
+                ("Language", 12), ("Prompt", 8), ("WER%", 6), ("CER%", 6),
+                ("RTFx", 6), ("Duration", 9), ("Processed", 9),
+            ]
+            var header = headerColumns
+                .map { $0.0.padding(toLength: $0.1, withPad: " ", startingAt: 0) }
+                .joined(separator: " | ")
+            header += " | Skipped"
+            print(header)
             print(String(repeating: "-", count: 80))
 
             for r in results {
