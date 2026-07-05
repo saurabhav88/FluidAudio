@@ -45,6 +45,16 @@ struct ChunkProcessor {
 
     private var maxModelSamples: Int { ASRConstants.maxModelSamples }
 
+    /// #1237 empty-chunk recovery (EnviousWispr fork carry, upstream #746 still open):
+    /// minimum encoder frames a window must have produced before an all-blank decode is
+    /// treated as recoverable speech (rather than genuine trailing silence / no speech).
+    /// 25 frames = 2.0s at `secondsPerEncoderFrame` (0.08s).
+    static let recoverableEmptyMinFrames: Int = 25
+
+    /// Static logger for the (static) #1237 recovery path — the instance
+    /// `logger` is not reachable from `static transcribeChunk`.
+    private static let recoveryLogger = AppLogger(category: "ChunkProcessor")
+
     private var noMelWarmupPrefixSamples: Int {
         noMelWarmupPrefixFrames * ASRConstants.samplesPerEncoderFrame
     }
@@ -678,10 +688,145 @@ struct ChunkProcessor {
         )
 
         if hypothesis.isEmpty || encoderSequenceLength == 0 {
+            // #1237 tail-clip recovery (EnviousWispr fork carry; upstream #746 open):
+            // a window with substantial encoder frames that decoded to ZERO tokens
+            // still carries real speech the TDT decoder blanked (typically the end of
+            // a dictation after a mid-sentence pause). Recover it by re-decoding the
+            // window's internal speech islands. Genuine trailing-silence / no-speech
+            // windows (few real frames) fall below the threshold and keep returning
+            // empty as today.
+            if encoderSequenceLength >= recoverableEmptyMinFrames {
+                if let recovered = try await recoverEmptyChunk(
+                    samples: samples,
+                    contextSamples: contextSamples,
+                    chunkStart: chunkStart,
+                    isLastChunk: isLastChunk,
+                    using: manager,
+                    maxModelSamples: maxModelSamples
+                ) {
+                    return recovered
+                }
+            }
             return ([], [], [], [])
         }
 
         return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, hypothesis.tokenDurations)
+    }
+
+    /// Global frame offset for a recovered island (v0.15.4 convention: offsets are
+    /// passed INTO the inference, so timestamps come out global). The samples array
+    /// begins at `chunkStart - contextSamples`; the detector snaps island starts to
+    /// encoder-frame multiples so the division is exact for frame-aligned chunk starts.
+    static func islandGlobalFrameOffset(
+        chunkStart: Int,
+        contextSamples: Int,
+        islandStartSampleWithinWindow: Int
+    ) -> Int {
+        max(0, chunkStart - contextSamples + islandStartSampleWithinWindow)
+            / ASRConstants.samplesPerEncoderFrame
+    }
+
+    /// Recover a window that decoded to ZERO tokens despite carrying substantial speech
+    /// (#1237 end-of-dictation tail clip; EnviousWispr fork carry). Splits the window's
+    /// `samples` at internal silence into speech islands, decodes each ONCE with a fresh
+    /// decoder state, and returns the assembled token tuple for `process()` to merge
+    /// exactly as a normal window.
+    ///
+    /// Timestamp basis (v0.15.4 convention): the normal path passes
+    /// `globalFrameOffset = chunkStart / samplesPerEncoderFrame` INTO the inference, so
+    /// returned timestamps are already global. Islands do the same with the island's own
+    /// absolute start: the samples array begins at `chunkStart - contextSamples`
+    /// (context-prefixed; the warmup path passes the array start as `chunkStart` with
+    /// `contextSamples == 0`), so an island's absolute start is
+    /// `chunkStart - contextSamples + island.start`. The detector snaps island starts down
+    /// to encoder-frame multiples so the division is exact for frame-aligned chunk starts.
+    ///
+    /// Heart-path safe and fail-open: returns `nil` (the caller falls back to today's
+    /// exact empty result) when there are no usable islands, the island count exceeds the
+    /// cap, or every island re-blanks. A single island that re-blanks is DROPPED while the
+    /// others are kept (partial recovery recovers strictly more real speech than
+    /// abandoning the window — never worse than today). A genuine decode error returns
+    /// `nil`; cancellation is rethrown so it aborts the whole transcription. Each island
+    /// decodes once — no recursion, no retry — so a blank can never loop.
+    static func recoverEmptyChunk(
+        samples: [Float],
+        contextSamples: Int,
+        chunkStart: Int,
+        isLastChunk: Bool,
+        using manager: AsrManager,
+        maxModelSamples: Int
+    ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int])? {
+        let detector = SilenceIslandDetector()
+        let islands = detector.islands(in: samples)
+        guard !islands.isEmpty, islands.count <= detector.maxIslands else {
+            recoveryLogger.warning(
+                "[ChunkDiag] recovery: \(islands.isEmpty ? "no speech islands" : "island count \(islands.count) > cap \(detector.maxIslands)") — fail-open"
+            )
+            return nil
+        }
+
+        let decoderLayers = await manager.decoderLayerCount
+        var tokens: [Int] = []
+        var timestamps: [Int] = []
+        var confidences: [Float] = []
+        var durations: [Int] = []
+
+        for island in islands {
+            let islandSamples = Array(samples[island.start..<island.end])
+            let padded = manager.padAudioIfNeeded(islandSamples, targetLength: maxModelSamples)
+            var state = TdtDecoderState.make(decoderLayers: decoderLayers)
+            state.reset()
+            let islandGlobalFrameOffset = Self.islandGlobalFrameOffset(
+                chunkStart: chunkStart,
+                contextSamples: contextSamples,
+                islandStartSampleWithinWindow: island.start)
+            do {
+                // Decode the island with a fresh decoder state. Pass through the OUTER
+                // window's isLastChunk: only the final window may fire the decoder's
+                // last-chunk finalization (flush the true tail); an interior empty window
+                // must NOT finalize, or it injects EOF boundary tokens/punctuation before
+                // the next chunk merges (Codex code-diff review, #1237).
+                let (hypothesis, islandEncoderLength) = try await manager.executeMLInferenceWithTimings(
+                    padded,
+                    originalLength: islandSamples.count,
+                    actualAudioFrames: nil,
+                    decoderState: &state,
+                    contextFrameAdjustment: 0,
+                    isLastChunk: isLastChunk,
+                    globalFrameOffset: islandGlobalFrameOffset
+                )
+                guard !hypothesis.isEmpty, islandEncoderLength > 0 else {
+                    // Drop this one island and KEEP the others (partial recovery) — a
+                    // dropped island is never worse than today, which loses the entire
+                    // window. Each island decodes once, so a deterministic blank can
+                    // never loop. (Semantics carried from the reviewed #1237 patch.)
+                    recoveryLogger.info(
+                        "[ChunkDiag] recovery: island [\(island.start),\(island.end)) re-blanked — dropped, keeping other islands"
+                    )
+                    continue
+                }
+                tokens.append(contentsOf: hypothesis.ySequence)
+                timestamps.append(contentsOf: hypothesis.timestamps)
+                confidences.append(contentsOf: hypothesis.tokenConfidences)
+                durations.append(contentsOf: hypothesis.tokenDurations)
+            } catch is CancellationError {
+                // Cancellation must abort the whole transcription, NOT degrade to a
+                // partial/empty result — rethrow so process()'s caller sees it.
+                throw CancellationError()
+            } catch {
+                recoveryLogger.warning(
+                    "[ChunkDiag] recovery: island decode failed (\(error.localizedDescription)) — fail-open")
+                return nil
+            }
+        }
+
+        guard !tokens.isEmpty else { return nil }
+        // Islands are processed left-to-right and each island's tokens are already
+        // time-ordered on the global basis, so the concatenation is in ascending
+        // timestamp order; process() merges it normally.
+        recoveryLogger.info(
+            "[ChunkDiag] recovery: recovered \(tokens.count) token(s) across \(islands.count) island(s)")
+        return (tokens, timestamps, confidences, durations)
     }
 
     /// Token IDs whose vocabulary piece may safely start the portion spliced
@@ -1115,5 +1260,111 @@ struct ChunkProcessor {
             }
         }
         return Array(left[..<leftEnd]) + Array(right[rightStart...])
+    }
+}
+
+/// Energy-based speech-island detector used ONLY by `ChunkProcessor.recoverEmptyChunk`
+/// (#1237 EnviousWispr fork carry) to split an already-failed (empty) ASR window at
+/// internal silence into 1..N speech islands. Energy-only (no VAD-model dependency) is
+/// acceptable because this runs solely on a window that ALREADY decoded empty: a wrong
+/// split costs at worst a slightly-worse re-decode, never dropped audio. The threshold is
+/// scale-invariant (works on normalized float or raw audio) so it needs no per-scale tuning.
+struct SilenceIslandDetector {
+    /// RMS analysis frame length in samples (100ms at 16kHz).
+    let analysisFrameSamples: Int
+    /// Minimum run of silent analysis frames that separates two islands.
+    let minSilenceFrames: Int
+    /// Minimum island length (samples) kept after padding.
+    let minIslandSamples: Int
+    /// Padding (samples) added on each side of a detected island.
+    let paddingSamples: Int
+    /// Hard cap on island count; above this the caller fails open.
+    let maxIslands: Int
+
+    init(minSilenceMs: Int = 300, minIslandMs: Int = 320, paddingMs: Int = 100, maxIslands: Int = 8) {
+        let sr = ASRConstants.sampleRate
+        self.analysisFrameSamples = max(1, sr / 10)  // 1600 = 100ms
+        self.minSilenceFrames = max(1, minSilenceMs / 100)
+        self.minIslandSamples = max(1, minIslandMs * sr / 1000)
+        self.paddingSamples = max(0, paddingMs * sr / 1000)
+        self.maxIslands = max(1, maxIslands)
+    }
+
+    /// Returns frame-aligned `[start, end)` sample ranges of speech islands within `samples`.
+    /// Island STARTS are snapped down to encoder-frame multiples so the caller's timestamp
+    /// offset (`islandStart / samplesPerEncoderFrame`) is exact; ends are clamped to the
+    /// window length (`padAudioIfNeeded` + `originalLength` handle a non-aligned tail).
+    func islands(in samples: [Float]) -> [(start: Int, end: Int)] {
+        let n = samples.count
+        guard n >= analysisFrameSamples else { return [] }
+        let frame = ASRConstants.samplesPerEncoderFrame
+
+        // 1. RMS per analysis frame.
+        var frameRMS: [Float] = []
+        frameRMS.reserveCapacity(n / analysisFrameSamples + 1)
+        var i = 0
+        while i < n {
+            let end = min(i + analysisFrameSamples, n)
+            var sumSquares: Float = 0
+            for s in i..<end { sumSquares += samples[s] * samples[s] }
+            frameRMS.append((sumSquares / Float(end - i)).squareRoot())
+            i += analysisFrameSamples
+        }
+        guard !frameRMS.isEmpty else { return [] }
+
+        // 2. Voiced threshold.
+        //    - Absolute silence floor: a window whose loudest frame is near-silent has no real
+        //      speech to recover → no islands (recovery fails open). This rejects all-silence.
+        //    - Otherwise threshold above the noise floor (20th-pct RMS), but CAPPED at half the
+        //      peak so a uniform all-speech window (noise floor ≈ peak) can't exclude its own
+        //      speech; floored at a small fraction of the peak so a low-noise-floor bimodal
+        //      window (the #1237 silence-then-speech shape) still splits at the speech edge.
+        let sortedRMS = frameRMS.sorted()
+        let noiseFloor = sortedRMS[min(sortedRMS.count - 1, (sortedRMS.count * 20) / 100)]
+        let peak = sortedRMS.last ?? 0
+        let speechFloor: Float = 0.005  // normalized-audio RMS below this peak = no speech
+        guard peak >= speechFloor else { return [] }
+        let threshold = max(peak * 0.05, min(noiseFloor * 2.5, peak * 0.5))
+        var voiced = frameRMS.map { $0 >= threshold }
+
+        // 3. Bridge silence gaps shorter than minSilenceFrames so micro-pauses don't split.
+        var g = 0
+        while g < voiced.count {
+            if !voiced[g] {
+                var j = g
+                while j < voiced.count && !voiced[j] { j += 1 }
+                if (j - g) < minSilenceFrames {
+                    for k in g..<j { voiced[k] = true }
+                }
+                g = j
+            } else {
+                g += 1
+            }
+        }
+
+        // 4. Extract voiced runs → padded, frame-aligned, non-overlapping islands.
+        var result: [(start: Int, end: Int)] = []
+        var lastEnd = 0
+        var f = 0
+        while f < voiced.count {
+            if voiced[f] {
+                var j = f
+                while j < voiced.count && voiced[j] { j += 1 }
+                var start = max(0, f * analysisFrameSamples - paddingSamples)
+                let end = min(n, j * analysisFrameSamples + paddingSamples)
+                // Frame-align the START down so islandStart / frame is exact, and keep islands
+                // disjoint (padding can never bridge a >=minSilence gap, but guard anyway).
+                start = (start / frame) * frame
+                start = max(start, lastEnd)
+                if end - start >= minIslandSamples {
+                    result.append((start: start, end: end))
+                    lastEnd = end
+                }
+                f = j
+            } else {
+                f += 1
+            }
+        }
+        return result
     }
 }
