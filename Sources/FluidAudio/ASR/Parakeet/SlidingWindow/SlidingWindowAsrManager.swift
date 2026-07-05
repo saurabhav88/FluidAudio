@@ -361,6 +361,18 @@ public actor SlidingWindowAsrManager {
                 if !remainder.isEmpty {
                     assembled += " " + remainder
                 }
+            } else if let deduped = Self.lcsDedupedRemainder(
+                prevWords: prevWords, currWords: currWords)
+            {
+                // Candidate 2 (#1329 PR-3, env FLUIDAUDIO_EW_STITCHER=lcs):
+                // the exact suffix-prefix match whiffed, but the chunk head is
+                // a DIVERGENT re-decode of prev's tail (the #1329 garble
+                // shape). Keep prev's version (decoded with full left acoustic
+                // context) and drop curr's re-decode through the last aligned
+                // word.
+                if !deduped.isEmpty {
+                    assembled += " " + deduped
+                }
             } else {
                 // Check for partial-word overlap at the boundary.
                 // Pattern: prev ends with "corrections." and curr starts with "ctions." --
@@ -386,6 +398,56 @@ public actor SlidingWindowAsrManager {
         }
 
         return assembled
+    }
+
+    /// Candidate 2 stitcher (#1329 PR-3 bake-off): divergent-overlap dedup via
+    /// the library's own LCS (`SequenceMatcher`, the ChunkProcessor primitive)
+    /// over normalized word windows at the seam. Opt-in ONLY via
+    /// `FLUIDAUDIO_EW_STITCHER=lcs` so the default path stays byte-identical
+    /// to the shipped exact-match stitcher; the winning engine ships
+    /// hard-wired in PR-4, never env-gated.
+    ///
+    /// Returns the remainder of `currWords` to append after dropping the
+    /// divergent re-decode of prev's tail, or nil when LCS finds no anchored
+    /// overlap (caller falls through to the fragment/append paths).
+    internal static func lcsDedupedRemainder(
+        prevWords: [String], currWords: [String]
+    ) -> String? {
+        guard ProcessInfo.processInfo.environment["FLUIDAUDIO_EW_STITCHER"] == "lcs" else {
+            return nil
+        }
+        let window = 15  // matches the exact-match search (~2s right context)
+        let prevTail = prevWords.suffix(window).map {
+            $0.trimmingCharacters(in: .punctuationCharacters).lowercased()
+        }
+        let currHead = currWords.prefix(window).map {
+            $0.trimmingCharacters(in: .punctuationCharacters).lowercased()
+        }
+        guard prevTail.count >= 2, currHead.count >= 2 else { return nil }
+
+        let matches = SequenceMatcher<String>.findLongestCommonSubsequence(
+            left: Array(prevTail), right: Array(currHead), matcher: ==)
+
+        // Anchoring: the garbled re-decode sits at the chunk HEAD. Require
+        // >= 2 aligned words, the first aligned curr word within the first 6
+        // positions (a garble can be LONGER than the real words: "three point
+        // five" re-decodes "3.5", pushing the first aligned word right), and
+        // a dense alignment (aligned words cover >= half the curr span they
+        // stretch over) so mid-window topic repetition cannot false-trigger
+        // a drop.
+        guard matches.count >= 2,
+            let first = matches.first, let last = matches.last,
+            first.rightStartIndex <= 5,
+            // Physical constraint: a re-decoded overlap corresponds to PREV'S
+            // TAIL (the right-context seconds). The alignment must reach
+            // prev's last 3 words — common function-word bigrams matching
+            // mid-tail ("we should") must never trigger a drop.
+            last.leftStartIndex >= prevTail.count - 3
+        else { return nil }
+        let span = last.rightStartIndex - first.rightStartIndex + 1
+        guard span > 0, Double(matches.count) / Double(span) >= 0.5 else { return nil }
+
+        return currWords.dropFirst(last.rightStartIndex + 1).joined(separator: " ")
     }
 
     /// Reset the transcriber for a new session

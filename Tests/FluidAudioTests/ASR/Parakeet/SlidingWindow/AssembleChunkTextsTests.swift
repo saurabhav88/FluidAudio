@@ -60,4 +60,82 @@ final class AssembleChunkTextsTests: XCTestCase {
             SlidingWindowAsrManager.assembleChunkTexts(["a b c", "", "c d"]), "a b c d",
             "empty middle chunk skipped, overlap still collapses")
     }
+
+    // MARK: - Candidate 2 (#1329 PR-3): LCS stitcher, env-gated
+
+    private func withLcsStitcher<T>(_ body: () throws -> T) rethrows -> T {
+        setenv("FLUIDAUDIO_EW_STITCHER", "lcs", 1)
+        defer { unsetenv("FLUIDAUDIO_EW_STITCHER") }
+        return try body()
+    }
+
+    func testLcsModeDedupesDivergentOverlap() {
+        // THE #1329 failure shape, now HEALED under the candidate-2 stitcher:
+        // the second window's garbled re-decode of prev's tail is dropped,
+        // prev's full-context decode wins.
+        withLcsStitcher {
+            let out = SlidingWindowAsrManager.assembleChunkTexts([
+                "compare Gemini 3.5 Flash and",
+                "Knight three point five flash and Apple Intelligence",
+            ])
+            XCTAssertEqual(out, "compare Gemini 3.5 Flash and Apple Intelligence")
+        }
+    }
+
+    func testLcsModeOffByDefault() {
+        // Without the env opt-in the divergent duplicate SURVIVES (parity with
+        // the shipped stitcher — the pinned limitation test above still holds).
+        let out = SlidingWindowAsrManager.assembleChunkTexts([
+            "compare Gemini 3.5 Flash and",
+            "Knight three point five flash and Apple Intelligence",
+        ])
+        XCTAssertEqual(
+            out,
+            "compare Gemini 3.5 Flash and Knight three point five flash and Apple Intelligence")
+    }
+
+    func testLcsModeDoesNotTouchExactOverlap() {
+        withLcsStitcher {
+            let out = SlidingWindowAsrManager.assembleChunkTexts([
+                "we compare Gemini 3.5 Flash and",
+                "Flash and Apple Intelligence today",
+            ])
+            XCTAssertEqual(out, "we compare Gemini 3.5 Flash and Apple Intelligence today")
+        }
+    }
+
+    func testLcsModeLeavesUnrelatedChunksAlone() {
+        // Shared vocabulary out of order must not trigger a drop.
+        withLcsStitcher {
+            let out = SlidingWindowAsrManager.assembleChunkTexts([
+                "we should meet again tomorrow morning",
+                "tomorrow we should review the notes",
+            ])
+            XCTAssertEqual(
+                out, "we should meet again tomorrow morning tomorrow we should review the notes")
+        }
+    }
+
+    func testLcsModePreservesIntentionalRepeats() {
+        withLcsStitcher {
+            let out = SlidingWindowAsrManager.assembleChunkTexts([
+                "GitHub GitHub GitHub is what I said",
+                "said and nothing else",
+            ])
+            XCTAssertEqual(out, "GitHub GitHub GitHub is what I said and nothing else")
+        }
+    }
+
+    // A legitimate continuation sharing the seam word is handled by the EXACT
+    // path first (overlap=1 on "and") — the LCS path never sees it, and no
+    // content is lost. Pinned so a reordering of the two paths shows up here.
+    func testLcsModeInOrderEchoAtSeamHeadIsSafe() {
+        withLcsStitcher {
+            let out = SlidingWindowAsrManager.assembleChunkTexts([
+                "so we ship it and",
+                "and then we ship the docs",
+            ])
+            XCTAssertEqual(out, "so we ship it and then we ship the docs")
+        }
+    }
 }
