@@ -54,7 +54,7 @@ public enum ContextBiasingConstants {
     ///
     /// - Value: `-12.0` (log-probability, ~6e-6 probability)
     /// - Used in: `CustomVocabularyContext.init()` as default
-    public static let defaultMinVocabCtcScore: Float = -12.0
+    public static let defaultMinVocabCtcScore: Float = -2.2
 
     /// CTC temperature for softmax probability distribution.
     ///
@@ -95,7 +95,7 @@ public enum ContextBiasingConstants {
     ///
     /// - Value: `0.52` (52% similarity required)
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
-    public static let defaultMinSimilarity: Float = 0.52
+    public static let defaultMinSimilarity: Float = 0.72
 
     /// Default minimum combined confidence threshold.
     ///
@@ -104,7 +104,7 @@ public enum ContextBiasingConstants {
     ///
     /// - Value: `0.54` (slightly above default similarity)
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
-    public static let defaultMinCombinedConfidence: Float = 0.54
+    public static let defaultMinCombinedConfidence: Float = 0.64
 
     /// Length ratio threshold below which stricter similarity is required.
     ///
@@ -150,7 +150,7 @@ public enum ContextBiasingConstants {
     /// - Value: `3.0` (log-probability boost)
     /// - Effect: Multiplies vocabulary term probability by ~20x (e^3.0)
     /// - Used in: `VocabularyRescorer.ctcTokenRescore()` and constrained CTC methods
-    public static let defaultCbw: Float = 3.0
+    public static let defaultCbw: Float = 1.5
 
     /// Default alpha value for weighted score combination.
     ///
@@ -160,7 +160,7 @@ public enum ContextBiasingConstants {
     /// - Value: `0.5` (equal weighting)
     /// - Range: 0.0 (LM only) to 1.0 (acoustic only)
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
-    public static let defaultAlpha: Float = 0.5
+    public static let defaultAlpha: Float = 2.8
 
     /// Default margin in seconds for CTC frame alignment.
     ///
