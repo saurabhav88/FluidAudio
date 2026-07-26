@@ -536,6 +536,25 @@ internal struct TdtDecoderV3: Sendable {
 
                 if token == config.tdtConfig.blankId {
                     consecutiveBlanks += 1
+                } else if !Self.isPunctuationOnlyPiece(token, vocabulary: vocabulary) {
+                    // EnviousWispr #1792: this block runs after the normal frame loop has
+                    // exhausted its time index. It still re-reads the final encoder frames,
+                    // so a token here is not acoustically ungrounded in principle — but with
+                    // no frames left to advance through, the prediction network's prior
+                    // dominates and it completes a sentence the speaker never finished
+                    // ("I was able to" -> "I was able to do that.").
+                    //
+                    // Flushing a pending PUNCTUATION mark here is the block's legitimate
+                    // purpose and is preserved. Lexical content is suppressed and counted
+                    // toward the existing consecutive-blank termination.
+                    //
+                    // Deliberately NOT consuming the token or advancing predictor state:
+                    // doing so would walk through an invented lexical chain looking for
+                    // punctuation. Stopping is the safer outcome, and it bounds the loop.
+                    //
+                    // Scope: this covers only post-exhaustion emission. An invented word
+                    // from the NORMAL loop, which carries a real frame index, is untouched.
+                    consecutiveBlanks += 1
                 } else {
                     consecutiveBlanks = 0  // Reset on non-blank
 
@@ -604,6 +623,22 @@ internal struct TdtDecoderV3: Sendable {
         // the issue #512 Polish samples (0 filter swaps across 7 clips), so no
         // filter call is needed here; post-processing handles deduplication.
         return hypothesis
+    }
+
+    /// EnviousWispr #1792: true when this token's vocabulary piece carries no letter and
+    /// no digit, i.e. it is punctuation/symbol rather than lexical content.
+    ///
+    /// Deliberately NOT `ASRConstants.punctuationTokens`: that is a 3-entry set built for
+    /// chunk-boundary dedup, and in the shipped v3 vocabulary its ids map to `.`, `й`, `ó`
+    /// rather than the sentence punctuation its comment implies. Using it stranded `?` on
+    /// 14 of 500 measured recordings.
+    ///
+    /// An unknown vocabulary id returns false (fail closed: suppress rather than emit).
+    internal static func isPunctuationOnlyPiece(_ token: Int, vocabulary: [Int: String]?) -> Bool {
+        guard let piece = vocabulary?[token] else { return false }
+        let stripped = piece.replacingOccurrences(of: "\u{2581}", with: "")
+        guard !stripped.isEmpty else { return false }
+        return stripped.allSatisfy { !$0.isLetter && !$0.isNumber }
     }
 
     internal static func shouldEmitToken(
