@@ -157,8 +157,12 @@ public enum ContextBiasingConstants {
     /// Used when combining acoustic and language model scores:
     /// `combinedScore = alpha * acousticScore + (1-alpha) * lmScore`
     ///
-    /// - Value: `0.5` (equal weighting)
-    /// - Range: 0.0 (LM only) to 1.0 (acoustic only)
+    /// - Value: `2.8` (EnviousWispr fork tune, FluidVoice-derived 2026-03-31).
+    ///   DELIBERATELY above the nominal 0...1 blend range: alpha > 1 gives the
+    ///   LM term negative weight, penalizing weak LM-driven vocabulary matches —
+    ///   empirically this eliminated phantom vocabulary insertions on the EW
+    ///   corpus. Nominal upstream range 0.0 (LM only) to 1.0 (acoustic only);
+    ///   upstream default was 0.5.
     /// - Used in: `CustomVocabularyContext.init()` as default parameter
     public static let defaultAlpha: Float = 2.8
 
