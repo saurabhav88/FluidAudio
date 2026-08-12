@@ -290,7 +290,7 @@ internal struct TdtDecoderV3: Sendable {
                 vocabulary: vocabulary,
                 blankId: blankId
             )
-            if let lang = language, lang.script == .latin, lang != .english,
+            if Self.shouldApplyEnglishBlocklist(language),
                 let ids = decision.topKIds, let logits = decision.topKLogits, let vocab = vocabulary
             {
                 Self.applyEnglishBlocklist(
@@ -377,7 +377,7 @@ internal struct TdtDecoderV3: Sendable {
                     vocabulary: vocabulary,
                     blankId: blankId
                 )
-                if let lang = language, lang.script == .latin, lang != .english,
+                if Self.shouldApplyEnglishBlocklist(language),
                     let ids = innerDecision.topKIds, let logits = innerDecision.topKLogits,
                     let vocab = vocabulary
                 {
@@ -651,8 +651,31 @@ internal struct TdtDecoderV3: Sendable {
 
     // MARK: - Private Helper Methods
 
-    /// When the target language is a non-English Latin-script language and the
-    /// winning token is in the English-exclusive blocklist, replace it with the
+    /// Whether `applyEnglishBlocklist` may run for `language`.
+    ///
+    /// French only. `englishBlocklistIds` is a hand-authored list whose own
+    /// comment describes its members as "essentially impossible in FRENCH
+    /// prose", and French is the language it was authored and validated against
+    /// (upstream 7d94a1b, "reduce English drift on French recordings").
+    ///
+    /// It previously ran for every non-English Latin-script language. That is
+    /// unsound for the other 20: the list bans ` was`, ` will`, ` so`, ` we`,
+    /// ` her` and ` not`, which are ordinary German words, and — because the
+    /// tokens are space-prefixed SentencePiece pieces — also the first pieces of
+    /// German compounds (`sowie`, `weiterhin`, `herzlich`). Measured on a
+    /// 120-clip German corpus, a German lock corrupted 25 transcripts and pushed
+    /// median WER on clean speech from 0.0% to 2.9%, including one case where
+    /// banning ` not` made the decoder emit a German translation of an English
+    /// clause.
+    ///
+    /// Widening this to another language requires that language's own measured
+    /// evidence, not the observation that it is also Latin-script.
+    static func shouldApplyEnglishBlocklist(_ language: Language?) -> Bool {
+        language == .french
+    }
+
+    /// When `shouldApplyEnglishBlocklist` admits the language and the winning
+    /// token is in the English-exclusive blocklist, replace it with the
     /// highest-logit top-K token that is not in the blocklist.
     ///
     /// This runs AFTER `tokenLanguageFilter` (which only distinguishes

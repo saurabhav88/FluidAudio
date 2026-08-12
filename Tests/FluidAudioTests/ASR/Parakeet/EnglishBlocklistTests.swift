@@ -109,4 +109,46 @@ final class EnglishBlocklistTests: XCTestCase {
         XCTAssertFalse(TdtDecoderV3.englishBlocklistIds.contains(481))  // ' le'
         XCTAssertFalse(TdtDecoderV3.englishBlocklistIds.contains(453))  // ' et'
     }
+
+    // MARK: - Scope
+    //
+    // The tests above drive `applyEnglishBlocklist` directly, so they pass no
+    // matter which languages the decoder actually applies it to. That is why an
+    // over-broad scope survived: the mechanism was tested and its APPLICABILITY
+    // was not. These pin the predicate itself.
+
+    func testBlocklistAppliesToFrench() {
+        XCTAssertTrue(TdtDecoderV3.shouldApplyEnglishBlocklist(.french))
+    }
+
+    func testBlocklistDoesNotApplyToOtherLatinLanguages() {
+        // Every one of these is Latin-script, and every one of them was subject
+        // to the blocklist before this was scoped. German is the measured case:
+        // the list bans ' was', ' will', ' so', ' we', ' her', ' not', which are
+        // ordinary German words and German compound prefixes.
+        for language in Language.allCases where language.script == .latin && language != .french {
+            XCTAssertFalse(
+                TdtDecoderV3.shouldApplyEnglishBlocklist(language),
+                "\(language.rawValue) is Latin-script but the blocklist was never "
+                    + "validated for it; widening needs that language's own evidence")
+        }
+    }
+
+    func testBlocklistDoesNotApplyToEnglishOrNonLatinOrNil() {
+        XCTAssertFalse(TdtDecoderV3.shouldApplyEnglishBlocklist(.english))
+        XCTAssertFalse(TdtDecoderV3.shouldApplyEnglishBlocklist(.russian))  // Cyrillic
+        XCTAssertFalse(TdtDecoderV3.shouldApplyEnglishBlocklist(.greek))
+        // nil means "no language was requested", which disables language
+        // conditioning entirely — the default the app ships today.
+        XCTAssertFalse(TdtDecoderV3.shouldApplyEnglishBlocklist(nil))
+    }
+
+    /// Guards the property the two decoder call sites rely on: they both consult
+    /// the same predicate, so exactly one language can ever reach the blocklist.
+    /// A future edit that admits a second language fails here rather than
+    /// silently corrupting that language's transcripts.
+    func testExactlyOneLanguageIsAdmitted() {
+        let admitted = Language.allCases.filter { TdtDecoderV3.shouldApplyEnglishBlocklist($0) }
+        XCTAssertEqual(admitted, [.french])
+    }
 }
