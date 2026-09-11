@@ -35,8 +35,6 @@ public actor SlidingWindowAsrManager {
     // accumulatedTokens). Lets per-chunk dedup require temporal adjacency so a
     // coincidental subword-prefix match between far-apart words isn't dropped (#787).
     private var accumulatedTokenTimestamps: [Int] = []
-    /// EW fork carry (ab05466c): per-chunk text for boundary-aware dedup in finish().
-    private var chunkTexts: [String] = []
 
     // Raw sample buffer for sliding-window assembly (absolute indexing)
     private var sampleBuffer: [Float] = []
@@ -171,7 +169,6 @@ public actor SlidingWindowAsrManager {
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
         accumulatedTokenTimestamps.removeAll()
-        chunkTexts.removeAll()
         failedWindowCount = 0
         lastWindowError = nil
 
@@ -268,12 +265,6 @@ public actor SlidingWindowAsrManager {
             if !confirmedTranscript.isEmpty { parts.append(confirmedTranscript) }
             if !volatileTranscript.isEmpty { parts.append(volatileTranscript) }
             finalText = parts.joined(separator: " ")
-        } else if !chunkTexts.isEmpty {
-            // EW fork carry (ab05466c): assemble from per-chunk texts with
-            // boundary-aware overlap removal — pairs with fresh-state-per-window
-            // in processWindow(). Only dedups at known chunk boundaries,
-            // preserving intentional repetitions within chunks.
-            finalText = Self.assembleChunkTexts(chunkTexts)
         } else if !accumulatedTokens.isEmpty,
             let reconstructedText = await asrManager?.convertTokensToText(accumulatedTokens)
         {
@@ -291,91 +282,6 @@ public actor SlidingWindowAsrManager {
         return finalText
     }
 
-    /// Assemble per-chunk text outputs with overlap removal at chunk boundaries
-    /// (EW fork carry, ab05466c — ported verbatim from the d5fcca4 fork tip).
-    /// Each chunk may re-decode some of the previous chunk's tail content due to fresh
-    /// decoder state. This method finds and removes the overlapping prefix of each
-    /// subsequent chunk.
-    internal static func assembleChunkTexts(_ chunks: [String]) -> String {
-        guard !chunks.isEmpty else { return "" }
-        guard chunks.count > 1 else { return chunks[0] }
-
-        var assembled = chunks[0]
-
-        for i in 1..<chunks.count {
-            let current = chunks[i]
-            guard !current.isEmpty else { continue }
-
-            // Find the longest suffix of `assembled` that matches a prefix of `current`
-            // Compare at word level for robustness
-            let prevWords = assembled.components(separatedBy: " ").filter { !$0.isEmpty }
-            let currWords = current.components(separatedBy: " ").filter { !$0.isEmpty }
-
-            // Search for overlap: last N words of prev == first N words of curr
-            // Check up to 15 words of overlap (covers ~2s of context at 150 wpm)
-            let maxOverlap = min(15, min(prevWords.count, currWords.count))
-            var bestOverlap = 0
-
-            for overlapLen in (1...max(1, maxOverlap)).reversed() {
-                let prevTail = prevWords.suffix(overlapLen).map {
-                    $0.trimmingCharacters(in: .punctuationCharacters).lowercased()
-                }
-                let currHead = currWords.prefix(overlapLen).map {
-                    $0.trimmingCharacters(in: .punctuationCharacters).lowercased()
-                }
-
-                if prevTail == Array(currHead) {
-                    bestOverlap = overlapLen
-                    break
-                }
-            }
-
-            if bestOverlap > 0 {
-                // When the overlap boundary word in assembled ends with punctuation that
-                // shouldn't be there (because the next chunk continues the sentence),
-                // strip the trailing punctuation from the overlap point.
-                let overlapEndWord = prevWords[prevWords.count - bestOverlap]
-                let overlapEndBase = overlapEndWord.trimmingCharacters(in: .punctuationCharacters)
-                if overlapEndWord != overlapEndBase && !overlapEndBase.isEmpty {
-                    // Replace the last occurrence of the punctuated word with the base form
-                    if let range = assembled.range(
-                        of: overlapEndWord, options: .backwards
-                    ) {
-                        assembled.replaceSubrange(range, with: overlapEndBase)
-                    }
-                }
-
-                // Skip the overlapping prefix of current chunk
-                let remainder = currWords.dropFirst(bestOverlap).joined(separator: " ")
-                if !remainder.isEmpty {
-                    assembled += " " + remainder
-                }
-            } else {
-                // Check for partial-word overlap at the boundary.
-                // Pattern: prev ends with "corrections." and curr starts with "ctions." --
-                // the first word of curr is a suffix of the last word of prev.
-                let lastPrevWord = prevWords.last ?? ""
-                let firstCurrWord = currWords.first ?? ""
-                let lastPrevBase = lastPrevWord.trimmingCharacters(in: .punctuationCharacters).lowercased()
-                let firstCurrBase = firstCurrWord.trimmingCharacters(in: .punctuationCharacters).lowercased()
-
-                if firstCurrBase.count >= 3 && lastPrevBase.count > firstCurrBase.count
-                    && lastPrevBase.hasSuffix(firstCurrBase)
-                {
-                    // Skip the partial-word fragment and append the rest
-                    let remainder = currWords.dropFirst(1).joined(separator: " ")
-                    if !remainder.isEmpty {
-                        assembled += " " + remainder
-                    }
-                } else {
-                    // No overlap found, just append
-                    assembled += " " + current
-                }
-            }
-        }
-
-        return assembled
-    }
 
     /// Reset the transcriber for a new session
     public func reset() async throws {
@@ -399,7 +305,6 @@ public actor SlidingWindowAsrManager {
         lastProcessedFrame = 0
         accumulatedTokens.removeAll()
         accumulatedTokenTimestamps.removeAll()
-        chunkTexts.removeAll()
 
         logger.info("SlidingWindowAsrManager reset for source: \(String(describing: self.audioSource))")
     }
@@ -521,12 +426,15 @@ public actor SlidingWindowAsrManager {
             // Start frame offset is now handled by decoder's timeJump mechanism
 
             // Call AsrManager directly with deduplication.
-            // EW fork carry (ab05466c, re-validated 2026-07-05 on v0.15.4): decode each
-            // window with FRESH decoder state. Carrying LSTM state across windows makes
-            // the decoder predict blanks too aggressively at chunk tails, silently
-            // dropping text at 60s+ (v0.15.4 as-is measured -12%..-28% word loss on the
-            // EW bench; fresh state restores parity). Token-level previousTokens dedup +
-            // finish()-time chunk text assembly own the boundary overlap instead.
+            // EW fork carry (ab05466c, re-validated 2026-07-05 on v0.15.4 and 2026-09-10
+            // on ec07aabf): decode each window with FRESH decoder state. Carrying LSTM
+            // state across windows makes the decoder predict blanks too aggressively at
+            // chunk tails, silently dropping text at 60s+ (v0.15.4 as-is measured
+            // -12%..-28% word loss on the EW bench; on ec07aabf stock lost 9 and 16 words
+            // on a 58 s and a 135 s recording that fresh state keeps).
+            // EnviousWispr #2788: transcribeChunk deduplication and processWindow's
+            // retirement of droppedPreviousTokens own boundary overlap; finish()
+            // reconstructs the accumulated tokens.
             guard decoderState != nil, let mgr = asrManager else {
                 logger.error("Decoder state not initialized")
                 return
@@ -582,9 +490,6 @@ public actor SlidingWindowAsrManager {
                     processingTime: processingTime
                 )
             else { return }
-
-            // Store per-chunk text for boundary-aware dedup in finish() (EW fork carry).
-            chunkTexts.append(interim.text)
 
             // Update state only after all required async calls complete successfully
             accumulatedTokens.append(contentsOf: tokens)
