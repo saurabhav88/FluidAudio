@@ -456,7 +456,8 @@ struct ChunkProcessor {
         using manager: AsrManager,
         startTime: Date,
         progressHandler: ((Double) async -> Void)? = nil,
-        language: Language? = nil
+        language: Language? = nil,
+        phraseBoost: PhraseBoostRequest? = nil
     ) async throws -> ASRResult {
         let requestedConcurrency = max(1, await manager.parallelChunkConcurrency)
         let workers = await makeWorkerPool(using: manager, count: requestedConcurrency) ?? [manager]
@@ -471,6 +472,13 @@ struct ChunkProcessor {
         // Dual-decode opt-in (only effective for v3 + no-mel; other paths
         // are not changed by the flag).
         if dualDecodeArbitration, !melChunkContext, modelVersion == .v3 {
+            // Boosting is not carried into the arbitration's second decode, so a
+            // boosted request fails here rather than returning a partly
+            // unboosted transcript (#3338). The nil path is unchanged.
+            if phraseBoost != nil {
+                throw ASRError.processingFailed(
+                    "Phrase boosting is not supported with dual-decode arbitration")
+            }
             return try await processWithDualDecodeArbitration(
                 using: manager,
                 workers: workers,
@@ -593,7 +601,10 @@ struct ChunkProcessor {
                             maxModelSamples: maxModelSamples,
                             language: language,
                             emitTokensAfterFrame: emitTokensAfterFrame,
-                            initialTimeIndexOverride: emitTokensAfterFrame == nil ? nil : 0
+                            initialTimeIndexOverride: emitTokensAfterFrame == nil ? nil : 0,
+                            // Immutable config only: each chunk's decoder call
+                            // builds its own call-local runtime (#3338).
+                            phraseBoost: phraseBoost?.forTrajectory(index)
                         )
 
                     guard
@@ -707,7 +718,8 @@ struct ChunkProcessor {
                 speechRmsThreshold: speechRmsThreshold,
                 spliceSafeTokenIds: spliceSafeTokenIds,
                 vocabulary: vocabulary,
-                language: language
+                language: language,
+                phraseBoost: phraseBoost
             )
         }
 
@@ -761,7 +773,8 @@ struct ChunkProcessor {
         maxModelSamples: Int,
         language: Language? = nil,
         emitTokensAfterFrame: Int? = nil,
-        initialTimeIndexOverride: Int? = nil
+        initialTimeIndexOverride: Int? = nil,
+        phraseBoost: PhraseBoostRequest? = nil
     ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int]) {
         guard !samples.isEmpty else { return ([], [], [], []) }
 
@@ -787,7 +800,8 @@ struct ChunkProcessor {
             globalFrameOffset: globalFrameOffset,
             language: language,
             emitTokensAfterGlobalFrame: emitTokensAfterFrame,
-            initialTimeIndexOverride: initialTimeIndexOverride
+            initialTimeIndexOverride: initialTimeIndexOverride,
+            phraseBoost: phraseBoost
         )
 
         if hypothesis.isEmpty || encoderSequenceLength == 0 {
@@ -1400,7 +1414,8 @@ struct ChunkProcessor {
         speechRmsThreshold: Float,
         spliceSafeTokenIds: Set<Int>?,
         vocabulary: [Int: String],
-        language: Language?
+        language: Language?,
+        phraseBoost: PhraseBoostRequest? = nil
     ) async throws -> [TokenWindow] {
         let frameSamples = ASRConstants.samplesPerEncoderFrame
         let frameDuration = ASRConstants.secondsPerEncoderFrame
@@ -1467,7 +1482,10 @@ struct ChunkProcessor {
                             using: manager,
                             decoderState: &decoderState,
                             maxModelSamples: maxModelSamples,
-                            language: language
+                            language: language,
+                            // A repair window is its own serial decode; its
+                            // decoder call builds its own runtime (#3338).
+                            phraseBoost: phraseBoost
                         )
 
                     guard windowTokens.count == windowTimestamps.count,

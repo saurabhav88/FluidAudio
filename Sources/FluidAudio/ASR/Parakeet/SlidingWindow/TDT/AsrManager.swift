@@ -234,11 +234,15 @@ public actor AsrManager {
         globalFrameOffset: Int = 0,
         language: Language? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
-        initialTimeIndexOverride: Int? = nil
+        initialTimeIndexOverride: Int? = nil,
+        phraseBoost: PhraseBoostRequest? = nil
     ) async throws -> TdtHypothesis {
         // Route to appropriate decoder based on model version
         guard let models = asrModels, let decoder_ = decoderModel, let joint = jointModel else {
             throw ASRError.notInitialized
+        }
+        if phraseBoost != nil, models.version != .v3 {
+            throw ASRError.processingFailed(Self.phraseBoostUnsupportedMessage(models.version))
         }
 
         // Adapt config to match the loaded model version
@@ -323,7 +327,9 @@ public actor AsrManager {
                 language: language,
                 vocabulary: vocabulary,
                 emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
-                initialTimeIndexOverride: initialTimeIndexOverride
+                initialTimeIndexOverride: initialTimeIndexOverride,
+                phraseBoost: phraseBoost?.config,
+                phraseBoostTrace: phraseBoost?.decoderTrace
             )
         case .tdtJa:
             // The Japanese model outputs Kanji / Hiragana / Katakana, none of
@@ -495,12 +501,24 @@ public actor AsrManager {
         decoderState: inout TdtDecoderState,
         language: Language? = nil
     ) async throws -> ASRResult {
+        try await transcribe(audioSamples, decoderState: &decoderState, language: language, phraseBoost: nil)
+    }
+
+    /// The public `transcribe` with an optional phrase-boost request (#3338):
+    /// same progress session, same state handling; nil is today's path.
+    internal func transcribe(
+        _ audioSamples: [Float],
+        decoderState: inout TdtDecoderState,
+        language: Language?,
+        phraseBoost: PhraseBoostRequest?
+    ) async throws -> ASRResult {
         let shouldEmitProgress = audioSamples.count > ASRConstants.maxModelSamples
         if shouldEmitProgress {
             _ = await progressEmitter.ensureSession()
         }
         do {
-            let result = try await transcribeWithState(audioSamples, decoderState: &decoderState, language: language)
+            let result = try await transcribeWithState(
+                audioSamples, decoderState: &decoderState, language: language, phraseBoost: phraseBoost)
 
             if shouldEmitProgress {
                 await progressEmitter.finishSession()
