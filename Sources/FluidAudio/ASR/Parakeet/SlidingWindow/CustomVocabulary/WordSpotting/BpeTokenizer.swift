@@ -4,18 +4,21 @@ import Foundation
 /// Only implements encoding - no decoding, chat templates, or other features.
 /// Supports the specific tokenizer.json format used by Parakeet models.
 ///
-/// Text normalization: Applies lowercasing + NFKC normalization before BPE encoding,
-/// matching the standard NeMo CTC tokenization pipeline.
+/// Text normalization: `encode` applies lowercasing + NFKC normalization before BPE
+/// encoding, matching the standard NeMo CTC tokenization pipeline. `encodeExact`
+/// takes an explicit `Normalization` and never substitutes `<unk>`.
 public final class BpeTokenizer: Sendable {
     private let vocab: [String: Int]
     private let merges: [(String, String)]
     private let addedTokens: [String: Int]
+    private let specialTokenIDs: Set<Int>
 
     public enum Error: Swift.Error, LocalizedError {
         case fileNotFound(URL)
         case invalidJSON(String)
         case missingField(String)
         case unsupportedTokenizerType(String)
+        case malformedMerge(index: Int)
 
         public var errorDescription: String? {
             switch self {
@@ -27,14 +30,41 @@ public final class BpeTokenizer: Sendable {
                 return "Missing required field: \(field)"
             case .unsupportedTokenizerType(let type):
                 return "Unsupported tokenizer type: \(type). Only 'BPE' is supported."
+            case .malformedMerge(let index):
+                return "Merge \(index) is neither \"a b\" nor a two-element array"
             }
         }
     }
 
+    /// Text normalization applied before BPE.
+    public enum Normalization: Sendable {
+        /// Lowercase, then NFKC. The CTC keyword-spotting default (`encode`).
+        case lowercasedCompatibility
+        /// NFC only: case and characters are kept; canonically decomposed accents compose.
+        case canonicalCasePreserving
+    }
+
+    /// Why `encodeExact` refused to spell a text.
+    public enum ExactEncodingFailure: Swift.Error, Equatable, Sendable {
+        /// Empty text, or a leading, trailing or repeated space (an empty word).
+        case emptyWord
+        /// The text contains the `▁` word-boundary mark itself (a Metaspace pre-tokenizer splits on
+        /// it rather than spelling it, which `encodeExact` does not model).
+        case boundaryMarkInInput
+        /// A BPE piece is not in the vocabulary.
+        case unknownPiece(String)
+        /// A BPE piece resolves only to an added (special) token.
+        case specialTokenPiece(String)
+    }
+
     /// Load tokenizer from a folder containing tokenizer.json
     public static func load(from modelFolder: URL) throws -> BpeTokenizer {
-        let tokenizerPath = modelFolder.appendingPathComponent("tokenizer.json")
+        try load(tokenizerFile: modelFolder.appendingPathComponent("tokenizer.json"))
+    }
 
+    /// Load tokenizer from a tokenizer.json-shaped file (`model.type` "BPE", `model.vocab`,
+    /// `model.merges` as "a b" strings or two-element arrays, optional `added_tokens`).
+    public static func load(tokenizerFile tokenizerPath: URL) throws -> BpeTokenizer {
         guard FileManager.default.fileExists(atPath: tokenizerPath.path) else {
             throw Error.fileNotFound(tokenizerPath)
         }
@@ -63,15 +93,21 @@ public final class BpeTokenizer: Sendable {
             throw Error.missingField("model.vocab")
         }
 
-        // Parse merges: ["a b", "c d", ...]
-        guard let mergesArray = model["merges"] as? [String] else {
+        // Parse merges in file order: ["a b", ...] or [["a", "b"], ...]
+        let merges: [(String, String)]
+        if let mergesArray = model["merges"] as? [String] {
+            merges = mergesArray.compactMap { mergeStr -> (String, String)? in
+                let parts = mergeStr.split(separator: " ", maxSplits: 1)
+                guard parts.count == 2 else { return nil }
+                return (String(parts[0]), String(parts[1]))
+            }
+        } else if let mergePairs = model["merges"] as? [[String]] {
+            merges = try mergePairs.enumerated().map { index, pair in
+                guard pair.count == 2 else { throw Error.malformedMerge(index: index) }
+                return (pair[0], pair[1])
+            }
+        } else {
             throw Error.missingField("model.merges")
-        }
-
-        let merges = mergesArray.compactMap { mergeStr -> (String, String)? in
-            let parts = mergeStr.split(separator: " ", maxSplits: 1)
-            guard parts.count == 2 else { return nil }
-            return (String(parts[0]), String(parts[1]))
         }
 
         // Parse added_tokens (special tokens like <unk>, <pad>)
@@ -95,6 +131,7 @@ public final class BpeTokenizer: Sendable {
         self.vocab = vocab
         self.merges = merges
         self.addedTokens = addedTokens
+        self.specialTokenIDs = Set(addedTokens.values)
     }
 
     /// Encode text to token IDs using BPE.
@@ -115,7 +152,7 @@ public final class BpeTokenizer: Sendable {
         prependWordBoundary: Bool = true
     ) -> [Int] {
         // Normalize: lowercase + NFKC normalization (matches NeMo CTC models)
-        let normalized = text.lowercased().precomposedStringWithCompatibilityMapping
+        let normalized = normalize(text, .lowercasedCompatibility)
 
         // Pre-tokenize: replace spaces with ▁ (sentencepiece style)
         let leading = prependWordBoundary ? ASRConstants.sentencePieceWordBoundary : ""
@@ -123,7 +160,68 @@ public final class BpeTokenizer: Sendable {
             leading + normalized.replacingOccurrences(of: " ", with: ASRConstants.sentencePieceWordBoundary)
 
         // Split into characters
-        var word = preprocessed.map { String($0) }
+        let word = applyMerges(preprocessed.map { String($0) })
+
+        // Convert tokens to IDs
+        return word.compactMap { token -> Int? in
+            // Check added tokens first (special tokens)
+            if let id = addedTokens[token] {
+                return id
+            }
+            // Then check vocabulary
+            if let id = vocab[token] {
+                return id
+            }
+            // Unknown token - return <unk> ID if available
+            return addedTokens["<unk>"] ?? vocab["<unk>"] ?? 0
+        }
+    }
+
+    /// Encode text to exact token IDs, or refuse.
+    ///
+    /// Splits on U+0020 like a `Metaspace` pre-tokenizer with `split: true`, prepends
+    /// the `▁` word boundary to each word, runs the same merges as `encode` on each
+    /// word's Unicode scalars, and resolves every piece in the vocabulary. Never
+    /// substitutes `<unk>`, never drops a piece and never returns a partial spelling.
+    public func encodeExact(
+        _ text: String,
+        normalization: Normalization
+    ) -> Result<[Int], ExactEncodingFailure> {
+        let normalized = normalize(text, normalization)
+        let words = normalized.split(separator: " ", omittingEmptySubsequences: false)
+        var ids: [Int] = []
+        for word in words {
+            guard !word.isEmpty else { return .failure(.emptyWord) }
+            guard !word.contains(ASRConstants.sentencePieceWordBoundary) else {
+                return .failure(.boundaryMarkInInput)
+            }
+            let symbols = (ASRConstants.sentencePieceWordBoundary + word).unicodeScalars.map { String($0) }
+            for piece in applyMerges(symbols) {
+                if let id = vocab[piece], !specialTokenIDs.contains(id), addedTokens[piece] == nil {
+                    ids.append(id)
+                } else if addedTokens[piece] != nil || vocab[piece] != nil {
+                    return .failure(.specialTokenPiece(piece))
+                } else {
+                    return .failure(.unknownPiece(piece))
+                }
+            }
+        }
+        return .success(ids)
+    }
+
+    private func normalize(_ text: String, _ normalization: Normalization) -> String {
+        switch normalization {
+        case .lowercasedCompatibility:
+            return text.lowercased().precomposedStringWithCompatibilityMapping
+        case .canonicalCasePreserving:
+            return text.precomposedStringWithCanonicalMapping
+        }
+    }
+
+    /// Apply BPE merges iteratively: the highest-priority (earliest) merge first, to every
+    /// occurrence, until no merge applies.
+    private func applyMerges(_ symbols: [String]) -> [String] {
+        var word = symbols
 
         // Apply BPE merges iteratively
         while word.count >= 2 {
@@ -163,19 +261,6 @@ public final class BpeTokenizer: Sendable {
             }
             word = newWord
         }
-
-        // Convert tokens to IDs
-        return word.compactMap { token -> Int? in
-            // Check added tokens first (special tokens)
-            if let id = addedTokens[token] {
-                return id
-            }
-            // Then check vocabulary
-            if let id = vocab[token] {
-                return id
-            }
-            // Unknown token - return <unk> ID if available
-            return addedTokens["<unk>"] ?? vocab["<unk>"] ?? 0
-        }
+        return word
     }
 }
