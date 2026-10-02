@@ -59,6 +59,34 @@ public actor AsrManager {
 
     /// Cached vocabulary loaded once during initialization
     internal var vocabulary: [Int: String] = [:]
+
+    /// Identity of the loaded model set: a `PreparedWindow` made under one set
+    /// is refused by another (#3338). Changes on every load and cleanup.
+    internal var loadedModelsID = UUID()
+
+    /// Front-end model calls, for tests that prove a prepared window's encoder
+    /// output is reused rather than recomputed (#3338).
+    internal struct FrontEndCounters: Equatable, Sendable {
+        var preprocessor = 0
+        var encoder = 0
+    }
+    internal var frontEndCounters = FrontEndCounters()
+
+    /// Test-only: awaited after each front-end model call when set, so a test
+    /// can cancel or reload at an exact inference boundary (#3338). Production
+    /// never sets it; a nil observer costs one optional check.
+    internal enum FrontEndStage: Sendable { case afterPreprocessor, afterEncoder }
+    internal var frontEndObserver: (@Sendable (FrontEndStage) async -> Void)?
+    internal func setFrontEndObserver(_ observer: (@Sendable (FrontEndStage) async -> Void)?) {
+        frontEndObserver = observer
+    }
+
+    /// Test-only: lifecycle events of prepared-window decode buffers (#3338).
+    internal enum PreparedBufferEvent: Sendable { case allocated, freed }
+    internal var preparedBufferObserver: AsyncStream<PreparedBufferEvent>.Continuation?
+    internal func setPreparedBufferObserver(_ observer: AsyncStream<PreparedBufferEvent>.Continuation?) {
+        preparedBufferObserver = observer
+    }
     #if DEBUG
     // Test-only setter
     internal func setVocabularyForTesting(_ vocab: [Int: String]) {
@@ -141,6 +169,7 @@ public actor AsrManager {
         self.decoderModel = models.decoder
         self.jointModel = models.joint
         self.vocabulary = models.vocabulary
+        self.loadedModelsID = UUID()
 
         logger.info("AsrManager loaded successfully with provided models")
     }
@@ -219,6 +248,7 @@ public actor AsrManager {
         encoderModel = nil
         decoderModel = nil
         jointModel = nil
+        loadedModelsID = UUID()
         Task { await sharedMLArrayCache.clear() }
         logger.info("AsrManager resources cleaned up")
     }

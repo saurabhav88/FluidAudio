@@ -23,42 +23,7 @@ extension AsrManager {
         let preprocessorAudioArray = preprocessorInput.featureValue(for: "audio_signal")?.multiArrayValue
 
         do {
-            guard let preprocessorModel = preprocessorModel else {
-                throw ASRError.notInitialized
-            }
-
-            try Task.checkCancellation()
-            let preprocessorOutput = try await preprocessorModel.compatPrediction(
-                from: preprocessorInput,
-                options: predictionOptions
-            )
-
-            let encoderOutputProvider: MLFeatureProvider
-            if let encoderModel = encoderModel {
-                // Split frontend: run separate encoder
-                let encoderInput = try prepareEncoderInput(
-                    encoder: encoderModel,
-                    preprocessorOutput: preprocessorOutput,
-                    originalInput: preprocessorInput
-                )
-
-                try Task.checkCancellation()
-                encoderOutputProvider = try await encoderModel.compatPrediction(
-                    from: encoderInput,
-                    options: predictionOptions
-                )
-            } else {
-                // Fused frontend: preprocessor output already contains encoder features
-                encoderOutputProvider = preprocessorOutput
-            }
-
-            let rawEncoderOutput = try extractFeatureValue(
-                from: encoderOutputProvider, key: "encoder", errorMessage: "Invalid encoder output")
-            let encoderLength = try extractFeatureValue(
-                from: encoderOutputProvider, key: "encoder_length",
-                errorMessage: "Invalid encoder output length")
-
-            let encoderSequenceLength = encoderLength[0].intValue
+            let (rawEncoderOutput, encoderSequenceLength) = try await runFrontEnd(preprocessorInput)
 
             // Calculate actual audio frames if not provided using shared constants
             let actualFrames =
@@ -90,6 +55,54 @@ extension AsrManager {
             }
             throw error
         }
+    }
+
+    /// Preprocessor then encoder (or the fused front end) for one prepared
+    /// input: the single owner of front-end inference, shared by ordinary
+    /// decoding and `prepareWindow` (#3338). Counts each model call for tests.
+    internal func runFrontEnd(
+        _ preprocessorInput: MLFeatureProvider
+    ) async throws -> (encoderOutput: MLMultiArray, encoderSequenceLength: Int) {
+        guard let preprocessorModel = preprocessorModel else {
+            throw ASRError.notInitialized
+        }
+
+        try Task.checkCancellation()
+        let preprocessorOutput = try await preprocessorModel.compatPrediction(
+            from: preprocessorInput,
+            options: predictionOptions
+        )
+        frontEndCounters.preprocessor += 1
+        if let frontEndObserver { await frontEndObserver(.afterPreprocessor) }
+
+        let encoderOutputProvider: MLFeatureProvider
+        if let encoderModel = encoderModel {
+            // Split frontend: run separate encoder
+            let encoderInput = try prepareEncoderInput(
+                encoder: encoderModel,
+                preprocessorOutput: preprocessorOutput,
+                originalInput: preprocessorInput
+            )
+
+            try Task.checkCancellation()
+            encoderOutputProvider = try await encoderModel.compatPrediction(
+                from: encoderInput,
+                options: predictionOptions
+            )
+            frontEndCounters.encoder += 1
+            if let frontEndObserver { await frontEndObserver(.afterEncoder) }
+        } else {
+            // Fused frontend: preprocessor output already contains encoder features
+            encoderOutputProvider = preprocessorOutput
+        }
+
+        let rawEncoderOutput = try extractFeatureValue(
+            from: encoderOutputProvider, key: "encoder", errorMessage: "Invalid encoder output")
+        let encoderLength = try extractFeatureValue(
+            from: encoderOutputProvider, key: "encoder_length",
+            errorMessage: "Invalid encoder output length")
+
+        return (rawEncoderOutput, encoderLength[0].intValue)
     }
 
     private func prepareEncoderInput(
