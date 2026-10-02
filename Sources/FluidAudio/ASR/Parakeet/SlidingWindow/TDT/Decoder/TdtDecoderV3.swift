@@ -113,7 +113,9 @@ internal struct TdtDecoderV3: Sendable {
         language: Language? = nil,
         vocabulary: [Int: String]? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
-        initialTimeIndexOverride: Int? = nil
+        initialTimeIndexOverride: Int? = nil,
+        phraseBoost: PhraseBoostConfig? = nil,
+        phraseBoostTrace: ((PhraseBoostTraceEvent) -> Void)? = nil
     ) async throws -> TdtHypothesis {
         // Early exit for very short audio (< 160ms)
         guard encoderSequenceLength > 1 else {
@@ -126,7 +128,15 @@ internal struct TdtDecoderV3: Sendable {
         // Script-filtering consumes top-K; skip the extraction when the caller
         // didn't provide a language (default path), so v3 joint runs don't pay
         // for K-length array allocations they'll never use.
-        let needsTopK = language != nil
+        // A phrase-boost runtime consumes top-K exactly as script filtering
+        // does, so the same gate arms it. Nothing changes when none is passed.
+        // The runtime is built here, per call, so it belongs to this one
+        // trajectory and never crosses an isolation boundary (#3338).
+        let phraseBoost = phraseBoost.map(PhraseBoostRuntime.init(config:))
+        defer {
+            if let phraseBoost { phraseBoostTrace?(.finished(phraseBoost.stats)) }
+        }
+        let needsTopK = language != nil || phraseBoost != nil
 
         // Build a stride-aware view so we can access encoder frames without extra copies
         let encoderFrames = try EncoderFrameView(
@@ -281,6 +291,23 @@ internal struct TdtDecoderV3: Sendable {
 
             let blankId = config.tdtConfig.blankId  // 8192 for v3 models
 
+            // Phrase boosting decides BEFORE the two hard filters, never after.
+            // Those filters exist to refuse a token outright, and a reward
+            // applied afterwards could hand back exactly the token they just
+            // refused. Deciding first leaves them authoritative.
+            var boostedPick: Int?
+            if let phraseBoost {
+                phraseBoostTrace?(.step(phraseBoost.stats))
+                if let picked = phraseBoost.pick(
+                    predicted: label, blankId: blankId, topKIds: decision.topKIds,
+                    topKLogits: decision.topKLogits)
+                {
+                    label = picked.token
+                    score = picked.probability
+                    boostedPick = picked.token
+                }
+            }
+
             Self.tokenLanguageFilter(
                 label: &label,
                 score: &score,
@@ -296,6 +323,10 @@ internal struct TdtDecoderV3: Sendable {
                 Self.applyEnglishBlocklist(
                     label: &label, score: &score,
                     topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
+            }
+            if let boostedPick {
+                phraseBoostTrace?(
+                    .override(site: .main, frame: timeIndices, picked: boostedPick, afterFilters: label))
             }
 
             // Map duration bin to actual frame count
@@ -368,6 +399,17 @@ internal struct TdtDecoderV3: Sendable {
                 label = innerDecision.token
                 score = TdtDurationMapping.clampProbability(innerDecision.probability)
 
+                var innerBoostedPick: Int?
+                if let phraseBoost,
+                    let picked = phraseBoost.pick(
+                        predicted: label, blankId: blankId, topKIds: innerDecision.topKIds,
+                        topKLogits: innerDecision.topKLogits)
+                {
+                    label = picked.token
+                    score = picked.probability
+                    innerBoostedPick = picked.token
+                }
+
                 Self.tokenLanguageFilter(
                     label: &label,
                     score: &score,
@@ -384,6 +426,12 @@ internal struct TdtDecoderV3: Sendable {
                     Self.applyEnglishBlocklist(
                         label: &label, score: &score,
                         topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
+                }
+                if let innerBoostedPick {
+                    phraseBoostTrace?(
+                        .override(
+                            site: .inner, frame: timeIndicesCurrentLabels, picked: innerBoostedPick,
+                            afterFilters: label))
                 }
 
                 duration = try TdtDurationMapping.mapDurationBin(
@@ -426,6 +474,7 @@ internal struct TdtDecoderV3: Sendable {
                     hypothesis.tokenDurations.append(duration)
                 }
                 hypothesis.lastToken = label  // Remember for next iteration
+                phraseBoost?.advance(consumed: label)
 
                 // CRITICAL: Update decoder LSTM with the new token
                 // This updates the language model context for better predictions
