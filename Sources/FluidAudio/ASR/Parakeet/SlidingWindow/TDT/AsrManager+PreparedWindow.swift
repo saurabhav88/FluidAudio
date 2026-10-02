@@ -10,10 +10,30 @@ import Foundation
 /// overwrite it and nothing mutable crosses an isolation boundary. Bound to the
 /// model set that made it; `decode` refuses it under any other.
 public struct PreparedWindow: Sendable {
-    /// Number of input samples the window was prepared from (before padding).
+    /// Where the encoder output came from (#3338).
+    public enum Origin: Sendable, Equatable {
+        /// `prepareWindow`: one standalone window.
+        case prepared
+        /// Captured from ordinary single-window batch transcription.
+        case batchSingleWindow
+        /// Captured from chunk `index` of ordinary multi-chunk batch transcription.
+        case batchChunk(index: Int)
+    }
+
+    /// Number of input samples the window was prepared from (before padding),
+    /// including any prepended context.
     public let sampleCount: Int
     /// The language option every decode of this window uses.
     public let decodeLanguage: Language?
+    public let origin: Origin
+    /// Global encoder frame of the window's first frame (0 for a standalone window).
+    public let globalFrameOffset: Int
+
+    // Decode geometry, exactly as the batch path decoded this window.
+    let contextFrameAdjustment: Int
+    let isLastChunk: Bool
+    let emitTokensAfterGlobalFrame: Int?
+    let initialTimeIndexOverride: Int?
 
     let encoderBytes: Data
     let encoderShape: [Int]
@@ -61,19 +81,15 @@ extension AsrManager {
 
         // The input array goes back to the shared cache on every exit, as in
         // `executeMLInferenceWithTimings`.
-        let frontEnd: (bytes: Data, output: MLMultiArray, length: Int)
+        let window: PreparedWindow
         do {
             let (encoderOutput, encoderSequenceLength) = try await runFrontEnd(preprocessorInput)
-            // The encoder's array may be padded between rows (strided), so copy
-            // its whole backing span and keep the strides with it.
-            let byteCount =
-                Self.backingElementCount(
-                    shape: encoderOutput.shape.map(\.intValue), strides: encoderOutput.strides.map(\.intValue))
-                * Self.byteWidth(of: encoderOutput.dataType)
-            guard byteCount > 0 else {
-                throw ASRError.processingFailed("Unsupported encoder output data type")
-            }
-            frontEnd = (Data(bytes: encoderOutput.dataPointer, count: byteCount), encoderOutput, encoderSequenceLength)
+            window = try Self.snapshotWindow(
+                encoderOutput: encoderOutput, encoderSequenceLength: encoderSequenceLength,
+                actualAudioFrames: ASRConstants.calculateEncoderFrames(from: frameAlignedLength),
+                sampleCount: samples.count, decodeLanguage: decodeLanguage, origin: .prepared,
+                globalFrameOffset: 0, contextFrameAdjustment: 0, isLastChunk: true,
+                emitTokensAfterGlobalFrame: nil, initialTimeIndexOverride: nil, modelsID: preparingModelsID)
             // A cancellation that arrived during the last front-end call must
             // not return a window. Ordinary transcription is not changed.
             try Task.checkCancellation()
@@ -81,26 +97,47 @@ extension AsrManager {
             if let preprocessorAudioArray { await sharedMLArrayCache.returnArray(preprocessorAudioArray) }
             throw error
         }
-        let encoderOutput = frontEnd.output
-        let shape = encoderOutput.shape.map(\.intValue)
-        let strides = encoderOutput.strides.map(\.intValue)
-        let dataType = encoderOutput.dataType.rawValue
         if let preprocessorAudioArray { await sharedMLArrayCache.returnArray(preprocessorAudioArray) }
         try Task.checkCancellation()
         guard isAvailable, loadedModelsID == preparingModelsID else {
             throw ASRError.processingFailed("The model set changed while preparing this window")
         }
+        return window
+    }
 
+    /// Immutable copy of one encoder output plus the geometry it was (or will
+    /// be) decoded with. The single place a window's bytes are taken (#3338).
+    /// The encoder's array may be padded between rows (strided), so the whole
+    /// backing span is copied and the strides kept with it.
+    static func snapshotWindow(
+        encoderOutput: MLMultiArray, encoderSequenceLength: Int, actualAudioFrames: Int, sampleCount: Int,
+        decodeLanguage: Language?, origin: PreparedWindow.Origin, globalFrameOffset: Int,
+        contextFrameAdjustment: Int, isLastChunk: Bool, emitTokensAfterGlobalFrame: Int?,
+        initialTimeIndexOverride: Int?, modelsID: UUID
+    ) throws -> PreparedWindow {
+        let shape = encoderOutput.shape.map(\.intValue)
+        let strides = encoderOutput.strides.map(\.intValue)
+        let byteCount =
+            backingElementCount(shape: shape, strides: strides) * byteWidth(of: encoderOutput.dataType)
+        guard byteCount > 0 else {
+            throw ASRError.processingFailed("Unsupported encoder output data type")
+        }
         return PreparedWindow(
-            sampleCount: samples.count,
+            sampleCount: sampleCount,
             decodeLanguage: decodeLanguage,
-            encoderBytes: frontEnd.bytes,
+            origin: origin,
+            globalFrameOffset: globalFrameOffset,
+            contextFrameAdjustment: contextFrameAdjustment,
+            isLastChunk: isLastChunk,
+            emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+            initialTimeIndexOverride: initialTimeIndexOverride,
+            encoderBytes: Data(bytes: encoderOutput.dataPointer, count: byteCount),
             encoderShape: shape,
             encoderStrides: strides,
-            encoderDataType: dataType,
-            encoderSequenceLength: frontEnd.length,
-            actualAudioFrames: ASRConstants.calculateEncoderFrames(from: frameAlignedLength),
-            modelsID: preparingModelsID)
+            encoderDataType: encoderOutput.dataType.rawValue,
+            encoderSequenceLength: encoderSequenceLength,
+            actualAudioFrames: actualAudioFrames,
+            modelsID: modelsID)
     }
 
     /// Decode a prepared window: a fresh decoder state every call, the window's
@@ -126,8 +163,12 @@ extension AsrManager {
             actualAudioFrames: window.actualAudioFrames,
             originalAudioSamples: [],
             decoderState: &decoderState,
-            isLastChunk: true,
+            contextFrameAdjustment: window.contextFrameAdjustment,
+            isLastChunk: window.isLastChunk,
+            globalFrameOffset: window.globalFrameOffset,
             language: window.decodeLanguage,
+            emitTokensAfterGlobalFrame: window.emitTokensAfterGlobalFrame,
+            initialTimeIndexOverride: window.initialTimeIndexOverride,
             phraseBoost: request
         )
         let result = processTranscriptionResult(
@@ -207,5 +248,118 @@ final class PreparedDecodeBuffer {
     deinit {
         pointer.deallocate()
         observer?.yield(.freed)
+    }
+}
+
+/// What `transcribeCapturingWindows` hands back (#3338 C.2b): the ordinary result
+/// and the encoder windows that produced it.
+public struct CapturedTranscription: Sendable {
+    /// Exactly what `transcribe` would have returned.
+    public let result: ASRResult
+    /// The windows the batch path decoded, in chunk order. Empty when ineligible.
+    public let windows: [PreparedWindow]
+    /// Why these windows do not explain the result, if they do not (dual-decode
+    /// arbitration, a seam repair that changed tokens). Nil means eligible.
+    public let ineligibleReason: String?
+}
+
+/// Collects captured windows from the single-window path and from concurrent
+/// chunk tasks. Sendable through an AsyncStream continuation, so no lock and no
+/// `@unchecked Sendable`.
+final class WindowCapture: Sendable {
+    enum Event: Sendable {
+        case window(PreparedWindow, tokens: [Int])
+        case ineligible(String)
+    }
+
+    private let stream: AsyncStream<Event>
+    private let continuation: AsyncStream<Event>.Continuation
+
+    init() {
+        (stream, continuation) = AsyncStream<Event>.makeStream()
+    }
+
+    func record(window: PreparedWindow, tokens: [Int]) {
+        continuation.yield(.window(window, tokens: tokens))
+    }
+
+    static let modelSetChanged = "model set changed during capture"
+
+    func markIneligible(_ reason: String) {
+        continuation.yield(.ineligible(reason))
+    }
+
+    /// Ends the capture and returns everything recorded, windows in chunk order.
+    func finish() async -> (windows: [(window: PreparedWindow, tokens: [Int])], ineligibleReason: String?) {
+        continuation.finish()
+        var windows: [(window: PreparedWindow, tokens: [Int])] = []
+        var reason: String?
+        for await event in stream {
+            switch event {
+            case .window(let window, let tokens): windows.append((window, tokens))
+            case .ineligible(let why): reason = reason ?? why
+            }
+        }
+        windows.sort { Self.order($0.window.origin) < Self.order($1.window.origin) }
+        return (windows, reason)
+    }
+
+    private static func order(_ origin: PreparedWindow.Origin) -> Int {
+        switch origin {
+        case .prepared, .batchSingleWindow: return -1
+        case .batchChunk(let index): return index
+        }
+    }
+}
+
+/// A capture bound to the window it will record (single window or chunk index).
+struct WindowCaptureBinding: Sendable {
+    let capture: WindowCapture
+    let origin: PreparedWindow.Origin
+}
+
+extension AsrManager {
+
+    /// Ordinary batch transcription that also hands back the encoder windows it
+    /// decoded (#3338 C.2b). The transcript is exactly `transcribe`'s; no extra
+    /// encoder runs. Requires the Parakeet v3 model; any other version, and
+    /// dual-decode arbitration or a token-changing seam repair, return the
+    /// ordinary result with no windows and a reason.
+    ///
+    /// Always starts from a fresh decoder state, because a captured window is
+    /// replayed from a fresh state; caller-owned predictor context could not be
+    /// reproduced.
+    public func transcribeCapturingWindows(
+        _ audioSamples: [Float],
+        language: Language? = nil
+    ) async throws -> CapturedTranscription {
+        let run = try await transcribeCapturingWindowsWithTokens(audioSamples, language: language)
+        if let reason = run.reason {
+            return CapturedTranscription(result: run.result, windows: [], ineligibleReason: reason)
+        }
+        return CapturedTranscription(result: run.result, windows: run.windows.map(\.window), ineligibleReason: nil)
+    }
+
+    /// The capturing run, with the tokens each window produced (tests read them).
+    internal func transcribeCapturingWindowsWithTokens(
+        _ audioSamples: [Float], language: Language? = nil
+    ) async throws -> (result: ASRResult, windows: [(window: PreparedWindow, tokens: [Int])], reason: String?) {
+        // The parent's identity at entry: worker windows carry it, and a reload
+        // anywhere during the run makes every window ineligible.
+        let modelsIDAtEntry = loadedModelsID
+        let capture = WindowCapture()
+        let eligibleModel = asrModels?.version == .v3
+        if !eligibleModel { capture.markIneligible("phrase boosting requires the Parakeet v3 model") }
+        var state = try TdtDecoderState(decoderLayers: decoderLayerCount)
+        let result = try await transcribe(
+            audioSamples, decoderState: &state, language: language, phraseBoost: nil,
+            windowCapture: eligibleModel ? capture : nil)
+        if loadedModelsID != modelsIDAtEntry { capture.markIneligible(WindowCapture.modelSetChanged) }
+        let captured = await capture.finish()
+        if captured.windows.contains(where: { $0.window.modelsID != modelsIDAtEntry }) {
+            return (result, [], WindowCapture.modelSetChanged)
+        }
+        guard captured.ineligibleReason == nil else { return (result, [], captured.ineligibleReason) }
+        return (result, captured.windows, nil)
     }
 }

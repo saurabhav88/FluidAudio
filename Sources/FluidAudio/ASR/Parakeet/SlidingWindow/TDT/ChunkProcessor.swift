@@ -457,7 +457,8 @@ struct ChunkProcessor {
         startTime: Date,
         progressHandler: ((Double) async -> Void)? = nil,
         language: Language? = nil,
-        phraseBoost: PhraseBoostRequest? = nil
+        phraseBoost: PhraseBoostRequest? = nil,
+        windowCapture: WindowCapture? = nil
     ) async throws -> ASRResult {
         let requestedConcurrency = max(1, await manager.parallelChunkConcurrency)
         let workers = await makeWorkerPool(using: manager, count: requestedConcurrency) ?? [manager]
@@ -479,6 +480,9 @@ struct ChunkProcessor {
                 throw ASRError.processingFailed(
                     "Phrase boosting is not supported with dual-decode arbitration")
             }
+            // Its windows are decoded twice and arbitrated, so none of them is
+            // the window that produced the result: nothing is handed over.
+            windowCapture?.markIneligible("dual-decode arbitration")
             return try await processWithDualDecodeArbitration(
                 using: manager,
                 workers: workers,
@@ -604,7 +608,10 @@ struct ChunkProcessor {
                             initialTimeIndexOverride: emitTokensAfterFrame == nil ? nil : 0,
                             // Immutable config only: each chunk's decoder call
                             // builds its own call-local runtime (#3338).
-                            phraseBoost: phraseBoost?.forTrajectory(index)
+                            phraseBoost: phraseBoost?.forTrajectory(index),
+                            windowCapture: windowCapture.map {
+                                WindowCaptureBinding(capture: $0, origin: .batchChunk(index: index))
+                            }
                         )
 
                     guard
@@ -709,6 +716,8 @@ struct ChunkProcessor {
             let minGapSeconds = await manager.seamGapRepairMinGapSeconds
             let speechRmsThreshold = try adaptiveSpeechRmsThreshold()
 
+            // Only a capturing run pays for this comparison (#3338).
+            let beforeRepair = windowCapture.map { _ in mergedTokens.map(\.token) }
             mergedTokens = try await repairSeamGaps(
                 in: mergedTokens,
                 using: workers[0],
@@ -721,6 +730,11 @@ struct ChunkProcessor {
                 language: language,
                 phraseBoost: phraseBoost
             )
+            // Repaired tokens came from extra windows that are not handed over,
+            // so the captured chunk windows no longer explain the whole result.
+            if let windowCapture, let beforeRepair, mergedTokens.map(\.token) != beforeRepair {
+                windowCapture.markIneligible("seam repair changed the merged tokens")
+            }
         }
 
         let allTokens = mergedTokens.map { $0.token }
@@ -774,7 +788,8 @@ struct ChunkProcessor {
         language: Language? = nil,
         emitTokensAfterFrame: Int? = nil,
         initialTimeIndexOverride: Int? = nil,
-        phraseBoost: PhraseBoostRequest? = nil
+        phraseBoost: PhraseBoostRequest? = nil,
+        windowCapture: WindowCaptureBinding? = nil
     ) async throws -> (tokens: [Int], timestamps: [Int], confidences: [Float], durations: [Int]) {
         guard !samples.isEmpty else { return ([], [], [], []) }
 
@@ -801,7 +816,8 @@ struct ChunkProcessor {
             language: language,
             emitTokensAfterGlobalFrame: emitTokensAfterFrame,
             initialTimeIndexOverride: initialTimeIndexOverride,
-            phraseBoost: phraseBoost
+            phraseBoost: phraseBoost,
+            windowCapture: windowCapture
         )
 
         if hypothesis.isEmpty || encoderSequenceLength == 0 {

@@ -4,7 +4,8 @@ extension AsrManager {
 
     internal func transcribeWithState(
         _ audioSamples: [Float], decoderState: inout TdtDecoderState, language: Language? = nil,
-        phraseBoost: PhraseBoostRequest? = nil
+        phraseBoost: PhraseBoostRequest? = nil,
+        windowCapture: WindowCapture? = nil
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
         let minimumRequiredSamples = ASRConstants.minimumRequiredSamples(forSampleRate: config.sampleRate)
@@ -23,7 +24,8 @@ extension AsrManager {
                 decoderState: &decoderState,
                 isLastChunk: true,  // Single-chunk: always first and last
                 language: language,
-                phraseBoost: phraseBoost
+                phraseBoost: phraseBoost,
+                windowCapture: windowCapture.map { WindowCaptureBinding(capture: $0, origin: .batchSingleWindow) }
             )
 
             let result = processTranscriptionResult(
@@ -49,7 +51,8 @@ extension AsrManager {
                 await self.progressEmitter.report(progress: progress)
             },
             language: language,
-            phraseBoost: phraseBoost
+            phraseBoost: phraseBoost,
+            windowCapture: windowCapture
         )
 
         return result

@@ -14,8 +14,12 @@ extension AsrManager {
         language: Language? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
         initialTimeIndexOverride: Int? = nil,
-        phraseBoost: PhraseBoostRequest? = nil
+        phraseBoost: PhraseBoostRequest? = nil,
+        windowCapture: WindowCaptureBinding? = nil
     ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
+        // Identity before the first suspension, so a reload while this window
+        // is being decoded can never relabel its encoder output (#3338).
+        let modelsIDAtEntry = loadedModelsID
 
         let preprocessorInput = try await preparePreprocessorInput(
             paddedAudio, actualLength: originalLength)
@@ -43,6 +47,24 @@ extension AsrManager {
                 initialTimeIndexOverride: initialTimeIndexOverride,
                 phraseBoost: phraseBoost
             )
+
+            // #3338 C.2b: hand over this decode's own encoder output, with the
+            // geometry it was decoded with. No second encoder run; nothing is
+            // copied unless a caller asked for capture.
+            if let windowCapture {
+                let window = try Self.snapshotWindow(
+                    encoderOutput: rawEncoderOutput, encoderSequenceLength: encoderSequenceLength,
+                    actualAudioFrames: actualFrames, sampleCount: originalLength ?? paddedAudio.count,
+                    decodeLanguage: language, origin: windowCapture.origin, globalFrameOffset: globalFrameOffset,
+                    contextFrameAdjustment: contextFrameAdjustment, isLastChunk: isLastChunk,
+                    emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+                    initialTimeIndexOverride: initialTimeIndexOverride, modelsID: modelsIDAtEntry)
+                if loadedModelsID == modelsIDAtEntry {
+                    windowCapture.capture.record(window: window, tokens: hypothesis.ySequence)
+                } else {
+                    windowCapture.capture.markIneligible(WindowCapture.modelSetChanged)
+                }
+            }
 
             if let preprocessorAudioArray {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)

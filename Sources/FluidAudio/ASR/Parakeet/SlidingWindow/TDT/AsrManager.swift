@@ -100,7 +100,18 @@ public actor AsrManager {
     }()
 
     public init(config: ASRConfig = .default, models: AsrModels? = nil) {
+        self.init(config: config, models: models, modelsID: UUID(), frontEndObserver: nil)
+    }
+
+    /// A worker clone carries its parent's model identity and (in tests only)
+    /// its front-end observer, so every chunk's model calls are counted (#3338).
+    internal init(
+        config: ASRConfig, models: AsrModels?, modelsID: UUID,
+        frontEndObserver: (@Sendable (FrontEndStage) async -> Void)?
+    ) {
         self.config = config
+        self.loadedModelsID = modelsID
+        self.frontEndObserver = frontEndObserver
 
         if let models {
             self.asrModels = models
@@ -134,7 +145,10 @@ public actor AsrManager {
 
     internal func makeWorkerClone() -> AsrManager? {
         guard let models = asrModels else { return nil }
-        return AsrManager(config: config, models: models)
+        // A clone shares this manager's loaded models, so it shares their
+        // identity: windows it captures decode on this manager (#3338).
+        return AsrManager(
+            config: config, models: models, modelsID: loadedModelsID, frontEndObserver: frontEndObserver)
     }
 
     /// Returns the current transcription progress stream for offline long audio (>240,000 samples / ~15s).
@@ -540,7 +554,8 @@ public actor AsrManager {
         _ audioSamples: [Float],
         decoderState: inout TdtDecoderState,
         language: Language?,
-        phraseBoost: PhraseBoostRequest?
+        phraseBoost: PhraseBoostRequest?,
+        windowCapture: WindowCapture? = nil
     ) async throws -> ASRResult {
         let shouldEmitProgress = audioSamples.count > ASRConstants.maxModelSamples
         if shouldEmitProgress {
@@ -548,7 +563,8 @@ public actor AsrManager {
         }
         do {
             let result = try await transcribeWithState(
-                audioSamples, decoderState: &decoderState, language: language, phraseBoost: phraseBoost)
+                audioSamples, decoderState: &decoderState, language: language, phraseBoost: phraseBoost,
+                windowCapture: windowCapture)
 
             if shouldEmitProgress {
                 await progressEmitter.finishSession()
