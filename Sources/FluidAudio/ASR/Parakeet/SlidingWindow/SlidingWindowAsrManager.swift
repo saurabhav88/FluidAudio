@@ -440,10 +440,16 @@ public actor SlidingWindowAsrManager {
             // Start frame offset is now handled by decoder's timeJump mechanism
 
             // Call AsrManager directly with deduplication
-            guard var state = decoderState else {
+            // EW #2788 invariant under qualification: every outer window starts
+            // fresh. Keep upstream inner re-decode, cutoff and seam logic intact.
+            // This does not establish output equivalence or an accuracy benefit.
+            guard decoderState != nil, let mgr = asrManager else {
                 logger.error("Decoder state not initialized")
                 return
             }
+            var state = TdtDecoderState.make(
+                decoderLayers: await mgr.decoderLayerCount)
+            state.reset()
 
             guard
                 let result = try await asrManager?.transcribeChunk(
