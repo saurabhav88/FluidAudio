@@ -556,11 +556,17 @@ public actor SlidingWindowAsrManager {
 
             // Call AsrManager directly with deduplication
             let previousTokenCount = accumulatedTokens.count
-            guard var state = decoderState else {
+            // EW #2788 invariant under qualification: every outer window starts
+            // fresh. Keep upstream inner re-decode, cutoff and seam logic intact.
+            // This does not establish output equivalence or an accuracy benefit.
+            guard decoderState != nil, let mgr = asrManager else {
                 failTokenStream(SlidingWindowTokenStreamError.invalidNativeUpdate)
                 logger.error("Decoder state not initialized")
                 return
             }
+            var state = TdtDecoderState.make(
+                decoderLayers: await mgr.decoderLayerCount)
+            state.reset()
 
             guard
                 let result = try await asrManager?.transcribeChunk(
