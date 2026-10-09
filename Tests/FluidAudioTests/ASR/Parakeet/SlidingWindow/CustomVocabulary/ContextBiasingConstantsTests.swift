@@ -51,8 +51,11 @@ final class ContextBiasingConstantsTests: XCTestCase {
     }
 
     func testDefaultAlphaInRange() {
+        // EW fork: alpha 2.8 is deliberately above the nominal 0...1 blend range
+        // (negative LM weight suppresses phantom vocabulary insertions — see the
+        // constant's doc comment). Bound loosely so a typo (e.g. 28.0) still trips.
         XCTAssertGreaterThanOrEqual(ContextBiasingConstants.defaultAlpha, 0.0)
-        XCTAssertLessThanOrEqual(ContextBiasingConstants.defaultAlpha, 1.0)
+        XCTAssertLessThanOrEqual(ContextBiasingConstants.defaultAlpha, 4.0)
     }
 
     // MARK: - rescorerConfig(forVocabSize:)
