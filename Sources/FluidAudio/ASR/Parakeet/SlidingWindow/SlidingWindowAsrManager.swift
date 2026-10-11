@@ -11,6 +11,10 @@ public actor SlidingWindowAsrManager {
     private let logger = AppLogger(category: "SlidingWindowASR")
     private let audioConverter: AudioConverter = AudioConverter()
     private let config: SlidingWindowAsrConfig
+    /// EW #3546: observation only. Called synchronously immediately before each window's
+    /// model call, so a caller can learn that this stream's audio entered inference. It must
+    /// not block, await or throw; nothing here depends on it.
+    private let onWindowInferenceEntered: (@Sendable () -> Void)?
 
     // Audio input stream
     private let inputSequence: AsyncStream<AVAudioPCMBuffer>
@@ -147,9 +151,16 @@ public actor SlidingWindowAsrManager {
     private var vocabBoostingEnabled: Bool { vocabularyBoosting != nil }
 
     /// Initialize the sliding-window ASR manager
-    /// - Parameter config: Configuration for streaming behavior
-    public init(config: SlidingWindowAsrConfig = .default) {
+    /// - Parameters:
+    ///   - config: Configuration for streaming behavior
+    ///   - onWindowInferenceEntered: EW #3546 observation, called immediately before each
+    ///     window's model call (see the property).
+    public init(
+        config: SlidingWindowAsrConfig = .default,
+        onWindowInferenceEntered: (@Sendable () -> Void)? = nil
+    ) {
         self.config = config
+        self.onWindowInferenceEntered = onWindowInferenceEntered
 
         // Create input stream
         let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
@@ -568,6 +579,9 @@ public actor SlidingWindowAsrManager {
                 decoderLayers: await mgr.decoderLayerCount)
             state.reset()
 
+            // EW #3546: no suspension between this check and the call below, so the
+            // observation fires exactly when the model call is made.
+            if asrManager != nil { onWindowInferenceEntered?() }
             guard
                 let result = try await asrManager?.transcribeChunk(
                     windowSamples,
